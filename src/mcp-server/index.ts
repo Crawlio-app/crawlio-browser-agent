@@ -37,7 +37,7 @@ const crawlio = new CrawlioClient();
 const tools = codeMode ? createCodeModeTools(bridge, crawlio) : createTools(bridge, crawlio);
 
 if (!codeMode) {
-  console.error("[MCP] Full mode — exposing all 92 tools");
+  console.error("[MCP] Full mode — exposing all 100 tools");
 } else {
   console.error("[MCP] Code mode (default) — 3 tools (search, execute, connect_tab)");
 }

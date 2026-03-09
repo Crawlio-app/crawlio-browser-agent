@@ -1154,7 +1154,8 @@ async function printSummary(options: InitOptions): Promise<void> {
     }
   } else {
     const modeLabel = options.full ? "Full mode" : "Code mode";
-    statusLines.push(`${green("+")} Mode        ${modeLabel} (3 tools, 133 commands)`);
+    const countLabel = options.full ? "(100 tools)" : "(3 tools, 133 commands)";
+    statusLines.push(`${green("+")} Mode        ${modeLabel} ${countLabel}`);
   }
 
   statusLines.push(`${green("+")} Skill       Browser automation installed`);

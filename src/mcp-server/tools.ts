@@ -3198,10 +3198,13 @@ export function parseSnapshotRef(selector: string): string | null {
 /** Build the `smart` object with actionability wrappers and framework-specific data accessors */
 async function buildSmartObject(bridge: WebSocketBridge): Promise<Record<string, unknown>> {
   const evaluate = (expression: string) => {
-    // Auto-wrap expressions containing bare `return` statements in an async IIFE.
-    // CDP Runtime.evaluate expects an expression, not a function body — `return` is illegal at top level.
+    // Auto-wrap bare `return` statements in an async IIFE for CDP Runtime.evaluate.
+    // Skip if expression starts with `(` — already a valid expression (IIFE, grouped, etc.)
+    // where any `return` is inside a nested function, not at top level.
+    const trimmed = expression.trim();
     const hasReturn = /(?:^|[;\n{])\s*return\s/m.test(expression);
-    const expr = hasReturn ? `(async () => { ${expression} })()` : expression;
+    const isExpression = trimmed.startsWith("(");
+    const expr = hasReturn && !isExpression ? `(async () => { ${expression} })()` : expression;
     return bridge.send({ type: "browser_evaluate", expression: expr }, 5000);
   };
 

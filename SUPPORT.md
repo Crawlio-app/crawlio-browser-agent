@@ -15,7 +15,7 @@ Before opening a new issue:
 
 ### Documentation
 
-- [Getting Started](https://crawlio.app/agent)
+- [Getting Started](https://www.crawlio.app/browser-agent)
 - [Architecture Guide](https://docs.crawlio.app/browser-agent/jit-context-runtime)
 
 ### What This Repo is NOT

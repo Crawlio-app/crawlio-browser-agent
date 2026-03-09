@@ -1158,7 +1158,7 @@ async function printSummary(options: InitOptions): Promise<void> {
   }
 
   statusLines.push(`${green("+")} Skill       Browser automation installed`);
-  statusLines.push(`${green("+")} Extension   ${cyan("https://crawlio.app/agent")}`);
+  statusLines.push(`${green("+")} Extension   ${cyan("https://www.crawlio.app/browser-agent")}`);
 
   if (options.cloudflare) {
     const mcpCfg = findMcpConfig();

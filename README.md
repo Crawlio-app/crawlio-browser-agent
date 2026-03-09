@@ -9,6 +9,11 @@ MCP server that gives AI full control of a live Chrome browser via CDP. 100 tool
 
 > **Note:** This repo supersedes [`crawlio-browser-mcp`](https://github.com/AshDevFr/crawlio-browser-mcp). All development now happens here.
 
+**Links:**
+- [Chrome Web Store](https://chromewebstore.google.com/detail/crawlio-for-chrome/amkgjkmjjihbaigdebmphghodhblmopg?utm_source=github-readme&utm_medium=readme&utm_campaign=browser-agent-funnel&utm_content=readme-cws-badge&utm_term=install-extension)
+- [Documentation](https://docs.crawlio.app/browser-agent/overview?utm_source=github-readme&utm_medium=readme&utm_campaign=docs-traffic&utm_content=readme-docs-link&utm_term=read-docs)
+- [Website](https://www.crawlio.app/browser-agent?utm_source=github-readme&utm_medium=readme&utm_campaign=browser-agent-funnel&utm_content=readme-website-link&utm_term=learn-more)
+
 ## When to use Crawlio Agent
 
 Use Crawlio Agent when your AI needs to interact with a **real browser** — SPAs, authenticated pages, dynamic content, JS-rendered frameworks. Unlike headless browser tools, Crawlio Agent connects to **your actual Chrome** via a lightweight extension, giving the AI access to your logged-in sessions, cookies, and full browser state.

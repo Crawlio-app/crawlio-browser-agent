@@ -42,7 +42,7 @@
     "session-recording",
     "network-capture"
   ],
-  "homepage": "https://crawlio.app/agent",
+  "homepage": "https://www.crawlio.app/browser-agent",
   "repository": {
     "type": "git",
     "url": "https://github.com/Crawlio-app/crawlio-browser-agent"

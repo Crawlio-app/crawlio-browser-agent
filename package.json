@@ -1,7 +1,7 @@
 {
   "name": "crawlio-browser",
-  "version": "1.5.6",
-  "description": "MCP server with 96 CDP-backed tools for browser automation — screenshots, DOM, network capture, framework detection, cookies, storage, session recording, performance metrics via Chrome",
+  "version": "1.5.7",
+  "description": "MCP server with 100 CDP-backed tools for browser automation — screenshots, DOM, network capture, framework detection, cookies, storage, session recording, structured data extraction, performance metrics via Chrome",
   "type": "module",
   "main": "dist/mcp-server/index.js",
   "bin": {

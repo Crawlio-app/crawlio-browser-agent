@@ -133,7 +133,9 @@ export type ServerCommand =
   // Session recording
   | { type: "start_recording"; id: string; maxDurationSec?: number; maxInteractions?: number }
   | { type: "stop_recording"; id: string }
-  | { type: "get_recording_status"; id: string };
+  | { type: "get_recording_status"; id: string }
+  // Network idle detection
+  | { type: "wait_for_network_idle"; id: string; timeout?: number; idleTime?: number };
 
 export type ExtensionResponse =
   | { type: "response"; id: string; success: true; data: unknown }

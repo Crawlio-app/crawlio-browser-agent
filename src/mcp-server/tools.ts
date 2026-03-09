@@ -10,7 +10,7 @@ import type { WebSocketBridge } from "./websocket-bridge.js";
 import type { CrawlioClient } from "./crawlio-client.js";
 import { TIMEOUTS } from "../shared/constants.js";
 import type { PageCapture, FrameworkDetection, NetworkEntry, ConsoleEntry, InteractionResult, CookieEntry, RecordingSession } from "../shared/types.js";
-import type { PageEvidence, ScrollEvidence, IdleStatus, ComparisonEvidence, Finding, CoverageGap, Observation, DimensionSlot, ComparableMetric, ComparisonScaffold, MethodTrace, StepTrace, ConfidenceLevel, AccessibilitySummary, MobileReadiness } from "../shared/evidence-types.js";
+import type { PageEvidence, ScrollEvidence, IdleStatus, ComparisonEvidence, Finding, CoverageGap, Observation, DimensionSlot, ComparableMetric, ComparisonScaffold, MethodTrace, StepTrace, ConfidenceLevel, AccessibilitySummary, MobileReadiness, TableCandidate, TableExtraction, NetworkIdleResult, DataExtraction } from "../shared/evidence-types.js";
 import { shapeListTabs, shapeConnectTab, shapeCapturePage, shapeConsoleLogs, shapeNetworkLog, shapeCookies, shapeInteraction } from "./response-shapers.js";
 import { compileRecording, sanitizeSkillName } from "./recording-compiler.js";
 import { loadEmbeddings, buildQueryEmbedding, semanticSearch, normalizeScores } from "./semantic-search.js";
@@ -207,6 +207,10 @@ export const TOOL_TIMEOUTS: Record<string, number> = {
   get_recording_status: 5000,
   compile_recording: 5000,
   ocr_screenshot: 30000,
+  wait_for_network_idle: 35000,
+  detect_tables: 15000,
+  extract_table: 15000,
+  extract_data: 30000,
 };
 
 // --- Structured response helpers ---
@@ -219,9 +223,9 @@ export function toolError(message: string) {
   return { content: [{ type: "text" as const, text: message }], isError: true };
 }
 
-// --- Actionability helpers (ported from Playwright's injectedScript.ts) ---
+// --- Actionability helpers ---
 
-/** Progressive backoff schedule from Playwright's _retryAction() */
+/** Progressive backoff schedule for actionability retries */
 export const ACTIONABILITY_BACKOFF = [0, 20, 100, 100, 500];
 
 /** Cache for buildSmartObject — keyed by page URL to avoid redundant detect_framework calls */
@@ -305,7 +309,7 @@ export async function checkActionability(
 }
 
 /**
- * Poll until element is actionable, using Playwright's progressive backoff.
+ * Poll until element is actionable, using progressive backoff.
  * Budget-style timeout — total wall time, not fixed retry count.
  */
 export async function pollActionability(
@@ -1389,7 +1393,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         return toolSuccess(data);
       },
     },
-    // Network replay (PiecesOS Heist Ph3)
+    // Network replay
     {
       name: "replay_request",
       description: "Re-fire a previously captured network request with optional modifications. Requires active network capture. Specify the request by URL. Optionally override headers, body, or method. Returns the new response status, headers, and body. Useful for API testing, auth token replay, and form submission testing.",
@@ -2636,6 +2640,424 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         }
       },
     },
+    // --- Network idle detection (Phase 11) ---
+    {
+      name: "wait_for_network_idle",
+      description: "Wait for all network requests to complete (idle detection). Uses CDP Network domain event tracking — catches ALL request types (fetch, XHR, images, CSS, fonts, scripts). Returns when no requests are pending for the specified idle window, or on timeout.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          timeout: { type: "number", description: "Max wait in ms (default 15000, max 30000)" },
+          idleTime: { type: "number", description: "Quiet window before declaring idle in ms (default 500, max 5000)" },
+        },
+      },
+      handler: async (args: Record<string, unknown>) => {
+        const schema = z.object({
+          timeout: z.number().int().min(100).max(30000).default(15000),
+          idleTime: z.number().int().min(100).max(5000).default(500),
+        });
+        const parsed = schema.parse(args);
+        const data = await bridge.send({
+          type: "wait_for_network_idle",
+          timeout: parsed.timeout,
+          idleTime: parsed.idleTime,
+        }, TOOL_TIMEOUTS.wait_for_network_idle);
+        return toolSuccess(data);
+      },
+    },
+    // --- Structured data extraction (Phase 11 — full-mode tools) ---
+    {
+      name: "detect_tables",
+      description: "Detect repeating data patterns (tables, lists, grids, card layouts) on the page using class-frequency scoring. Returns ranked candidates with selectors, row counts, and sample text. Use extract_table to extract data from a candidate.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          maxCandidates: { type: "number", description: "Maximum candidates to return (default 5, max 20)" },
+        },
+      },
+      handler: async (args: Record<string, unknown>) => {
+        const schema = z.object({
+          maxCandidates: z.number().int().min(1).max(20).default(5),
+        });
+        const parsed = schema.parse(args);
+        const maxCandidates = parsed.maxCandidates;
+        const result = await bridge.send({
+          type: "browser_evaluate",
+          expression: `(() => {
+      function getClasses(el) {
+        return (el.className || '').toString().trim().split(/\\s+/).filter(c => c && !c.match(/\\d/));
+      }
+      function getMatchingChildren(parent) {
+        const children = [...parent.children].filter(c =>
+          !['SCRIPT','IMG','STYLE','SVG','NOSCRIPT'].includes(c.tagName) &&
+          c.textContent.trim().length > 0
+        );
+        if (children.length < 2) return [];
+        const freq = {};
+        children.forEach(c => {
+          const key = getClasses(c).sort().join(' ');
+          freq[key] = (freq[key] || 0) + 1;
+        });
+        const threshold = children.length / 2 - 2;
+        let patterns = Object.keys(freq).filter(k => k && freq[k] >= threshold);
+        if (!patterns.length) {
+          const indiv = {};
+          children.forEach(c => getClasses(c).forEach(cls => { indiv[cls] = (indiv[cls] || 0) + 1; }));
+          patterns = Object.keys(indiv).filter(k => indiv[k] >= threshold);
+        }
+        return children.filter(c => {
+          const cls = getClasses(c);
+          return patterns.some(p => p.split(' ').every(pc => !pc || cls.includes(pc)));
+        });
+      }
+      function buildSelector(el) {
+        const parts = [];
+        let node = el;
+        while (node && node !== document.body && node !== document.documentElement) {
+          let tag = node.tagName.toLowerCase();
+          if (node.id && !/\\d/.test(node.id)) tag += '#' + CSS.escape(node.id);
+          else if (node.className && typeof node.className === 'string') {
+            const cls = node.className.trim().split(/\\s+/).filter(Boolean).slice(0, 3);
+            if (cls.length) tag += '.' + cls.map(c => CSS.escape(c)).join('.');
+          }
+          parts.unshift(tag);
+          node = node.parentElement;
+        }
+        return parts.join(' > ');
+      }
+      const candidates = [];
+      document.querySelectorAll('body *').forEach(el => {
+        const w = el.offsetWidth, h = el.offsetHeight;
+        if (w < 100 || h < 50) return;
+        const matching = getMatchingChildren(el);
+        if (matching.length < 2) return;
+        const score = w * h * matching.length * matching.length;
+        const text = matching.map(c => c.textContent.trim()).join(' ').substring(0, 200);
+        candidates.push({ selector: buildSelector(el), score, rowCount: matching.length, sampleText: text, area: w * h });
+      });
+      candidates.sort((a, b) => b.score - a.score);
+      return candidates.slice(0, ${maxCandidates});
+    })()`,
+        }, TOOL_TIMEOUTS.detect_tables);
+        const data = result as { result?: unknown };
+        return toolSuccess(data?.result ?? []);
+      },
+    },
+    {
+      name: "extract_table",
+      description: "Extract structured data from a container element using IDS-inspired recursive path-keyed extraction. Pass a selector from detect_tables. Returns columns (with fill rates) and rows as key-value objects.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: { type: "string", description: "CSS selector of the container element" },
+          maxRows: { type: "number", description: "Maximum rows to extract (default 200, max 1000)" },
+        },
+        required: ["selector"],
+      },
+      handler: async (args: Record<string, unknown>) => {
+        const schema = z.object({
+          selector: z.string().min(1),
+          maxRows: z.number().int().min(1).max(1000).default(200),
+        });
+        const parsed = schema.parse(args);
+        const selector = parsed.selector;
+        const maxRows = parsed.maxRows;
+        const result = await bridge.send({
+          type: "browser_evaluate",
+          expression: `(() => {
+      function getClasses(el) {
+        return (el.className || '').toString().trim().split(/\\s+/).filter(c => c && !c.match(/\\d/));
+      }
+      function getMatchingChildren(parent) {
+        const children = [...parent.children].filter(c =>
+          !['SCRIPT','IMG','STYLE','SVG','NOSCRIPT'].includes(c.tagName) &&
+          c.textContent.trim().length > 0
+        );
+        if (children.length < 2) return [];
+        const freq = {};
+        children.forEach(c => {
+          const key = getClasses(c).sort().join(' ');
+          freq[key] = (freq[key] || 0) + 1;
+        });
+        const threshold = children.length / 2 - 2;
+        let patterns = Object.keys(freq).filter(k => k && freq[k] >= threshold);
+        if (!patterns.length) {
+          const indiv = {};
+          children.forEach(c => getClasses(c).forEach(cls => { indiv[cls] = (indiv[cls] || 0) + 1; }));
+          patterns = Object.keys(indiv).filter(k => indiv[k] >= threshold);
+        }
+        return children.filter(c => {
+          const cls = getClasses(c);
+          return patterns.some(p => p.split(' ').every(pc => !pc || cls.includes(pc)));
+        });
+      }
+      function directText(el) {
+        let text = '';
+        for (const n of el.childNodes) {
+          if (n.nodeType === 3) text += n.textContent;
+        }
+        return text.trim();
+      }
+      function extractRow(el, prefix) {
+        const data = {};
+        const tag = el.tagName.toLowerCase();
+        const cls = getClasses(el).slice(0, 2).join('.');
+        const key = prefix + '/' + (cls ? tag + '.' + cls : tag);
+        const dt = directText(el);
+        if (dt) data[key] = dt;
+        if (el.href) data[key + ' href'] = el.href;
+        if (el.src) data[key + ' src'] = el.src;
+        for (const child of el.children) {
+          Object.assign(data, extractRow(child, key));
+        }
+        return data;
+      }
+      const container = document.querySelector(${JSON.stringify(selector)});
+      if (!container) return { selector: ${JSON.stringify(selector)}, columns: [], rows: [], totalRows: 0, truncated: false };
+      const matching = getMatchingChildren(container);
+      const totalRows = matching.length;
+      const limited = matching.slice(0, ${maxRows});
+      const rawRows = limited.map(el => extractRow(el, ''));
+      const allKeys = new Set();
+      rawRows.forEach(r => Object.keys(r).forEach(k => allKeys.add(k)));
+      const columns = [];
+      const keyToName = {};
+      for (const key of allKeys) {
+        const values = rawRows.map(r => r[key] || '');
+        const filled = values.filter(v => v).length;
+        const fillRate = filled / rawRows.length;
+        if (fillRate < 0.2) continue;
+        const unique = new Set(values.filter(v => v));
+        if (unique.size <= 1 && rawRows.length > 2) continue;
+        const parts = key.split('/').filter(Boolean);
+        const last = parts[parts.length - 1] || key;
+        let name = last.replace(/^[a-z]+\\./, '').replace(/ (href|src)$/, ' $1').replace(/\\./g, ' ').trim() || last;
+        keyToName[key] = name;
+        columns.push({ name, path: key, fillRate: Math.round(fillRate * 100) / 100 });
+      }
+      const nameCount = {};
+      columns.forEach(c => { nameCount[c.name] = (nameCount[c.name] || 0) + 1; });
+      const nameSeen = {};
+      columns.forEach(c => {
+        if (nameCount[c.name] > 1) {
+          nameSeen[c.name] = (nameSeen[c.name] || 0) + 1;
+          if (nameSeen[c.name] > 1) c.name = c.name + ' ' + nameSeen[c.name];
+        }
+      });
+      const rows = rawRows.map(raw => {
+        const row = {};
+        columns.forEach(c => { row[c.name] = raw[c.path] || ''; });
+        return row;
+      });
+      return { selector: ${JSON.stringify(selector)}, columns, rows, totalRows, truncated: totalRows > ${maxRows} };
+    })()`,
+        }, TOOL_TIMEOUTS.extract_table);
+        const data = result as { result?: unknown };
+        return toolSuccess(data?.result ?? { selector, columns: [], rows: [], totalRows: 0, truncated: false });
+      },
+    },
+    {
+      name: "extract_data",
+      description: "Compound extraction: detect tables + extract each + collect JSON-LD structured data from the page. Returns all tables with columns/rows plus any schema.org/JSON-LD data. Combines detect_tables, extract_table, and JSON-LD extraction in one call.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          maxTables: { type: "number", description: "Maximum tables to extract (default 3, max 10)" },
+          maxRowsPerTable: { type: "number", description: "Maximum rows per table (default 200, max 1000)" },
+        },
+      },
+      handler: async (args: Record<string, unknown>) => {
+        const schema = z.object({
+          maxTables: z.number().int().min(1).max(10).default(3),
+          maxRowsPerTable: z.number().int().min(1).max(1000).default(200),
+        });
+        const parsed = schema.parse(args);
+        const maxTables = parsed.maxTables;
+        const maxRowsPerTable = parsed.maxRowsPerTable;
+
+        // Get current URL
+        const status = await bridge.send({ type: "get_connection_status" }, 5000) as { connectedTab?: { url?: string } };
+        const url = status?.connectedTab?.url || "";
+
+        // Detect tables
+        const detectResult = await bridge.send({
+          type: "browser_evaluate",
+          expression: `(() => {
+      function getClasses(el) {
+        return (el.className || '').toString().trim().split(/\\s+/).filter(c => c && !c.match(/\\d/));
+      }
+      function getMatchingChildren(parent) {
+        const children = [...parent.children].filter(c =>
+          !['SCRIPT','IMG','STYLE','SVG','NOSCRIPT'].includes(c.tagName) &&
+          c.textContent.trim().length > 0
+        );
+        if (children.length < 2) return [];
+        const freq = {};
+        children.forEach(c => {
+          const key = getClasses(c).sort().join(' ');
+          freq[key] = (freq[key] || 0) + 1;
+        });
+        const threshold = children.length / 2 - 2;
+        let patterns = Object.keys(freq).filter(k => k && freq[k] >= threshold);
+        if (!patterns.length) {
+          const indiv = {};
+          children.forEach(c => getClasses(c).forEach(cls => { indiv[cls] = (indiv[cls] || 0) + 1; }));
+          patterns = Object.keys(indiv).filter(k => indiv[k] >= threshold);
+        }
+        return children.filter(c => {
+          const cls = getClasses(c);
+          return patterns.some(p => p.split(' ').every(pc => !pc || cls.includes(pc)));
+        });
+      }
+      function buildSelector(el) {
+        const parts = [];
+        let node = el;
+        while (node && node !== document.body && node !== document.documentElement) {
+          let tag = node.tagName.toLowerCase();
+          if (node.id && !/\\d/.test(node.id)) tag += '#' + CSS.escape(node.id);
+          else if (node.className && typeof node.className === 'string') {
+            const cls = node.className.trim().split(/\\s+/).filter(Boolean).slice(0, 3);
+            if (cls.length) tag += '.' + cls.map(c => CSS.escape(c)).join('.');
+          }
+          parts.unshift(tag);
+          node = node.parentElement;
+        }
+        return parts.join(' > ');
+      }
+      const candidates = [];
+      document.querySelectorAll('body *').forEach(el => {
+        const w = el.offsetWidth, h = el.offsetHeight;
+        if (w < 100 || h < 50) return;
+        const matching = getMatchingChildren(el);
+        if (matching.length < 2) return;
+        const score = w * h * matching.length * matching.length;
+        const text = matching.map(c => c.textContent.trim()).join(' ').substring(0, 200);
+        candidates.push({ selector: buildSelector(el), score, rowCount: matching.length, sampleText: text, area: w * h });
+      });
+      candidates.sort((a, b) => b.score - a.score);
+      return candidates.slice(0, ${maxTables});
+    })()`,
+        }, TOOL_TIMEOUTS.detect_tables) as { result?: Array<{ selector: string; score: number; rowCount: number }> };
+
+        const candidates = (detectResult as { result?: Array<{ selector: string }> })?.result ?? [];
+
+        // Extract each candidate
+        const tables: Array<Record<string, unknown>> = [];
+        for (const candidate of candidates) {
+          const sel = candidate.selector;
+          const extractResult = await bridge.send({
+            type: "browser_evaluate",
+            expression: `(() => {
+      function getClasses(el) {
+        return (el.className || '').toString().trim().split(/\\s+/).filter(c => c && !c.match(/\\d/));
+      }
+      function getMatchingChildren(parent) {
+        const children = [...parent.children].filter(c =>
+          !['SCRIPT','IMG','STYLE','SVG','NOSCRIPT'].includes(c.tagName) &&
+          c.textContent.trim().length > 0
+        );
+        if (children.length < 2) return [];
+        const freq = {};
+        children.forEach(c => {
+          const key = getClasses(c).sort().join(' ');
+          freq[key] = (freq[key] || 0) + 1;
+        });
+        const threshold = children.length / 2 - 2;
+        let patterns = Object.keys(freq).filter(k => k && freq[k] >= threshold);
+        if (!patterns.length) {
+          const indiv = {};
+          children.forEach(c => getClasses(c).forEach(cls => { indiv[cls] = (indiv[cls] || 0) + 1; }));
+          patterns = Object.keys(indiv).filter(k => indiv[k] >= threshold);
+        }
+        return children.filter(c => {
+          const cls = getClasses(c);
+          return patterns.some(p => p.split(' ').every(pc => !pc || cls.includes(pc)));
+        });
+      }
+      function directText(el) {
+        let text = '';
+        for (const n of el.childNodes) {
+          if (n.nodeType === 3) text += n.textContent;
+        }
+        return text.trim();
+      }
+      function extractRow(el, prefix) {
+        const data = {};
+        const tag = el.tagName.toLowerCase();
+        const cls = getClasses(el).slice(0, 2).join('.');
+        const key = prefix + '/' + (cls ? tag + '.' + cls : tag);
+        const dt = directText(el);
+        if (dt) data[key] = dt;
+        if (el.href) data[key + ' href'] = el.href;
+        if (el.src) data[key + ' src'] = el.src;
+        for (const child of el.children) {
+          Object.assign(data, extractRow(child, key));
+        }
+        return data;
+      }
+      const container = document.querySelector(${JSON.stringify(sel)});
+      if (!container) return { selector: ${JSON.stringify(sel)}, columns: [], rows: [], totalRows: 0, truncated: false };
+      const matching = getMatchingChildren(container);
+      const totalRows = matching.length;
+      const limited = matching.slice(0, ${maxRowsPerTable});
+      const rawRows = limited.map(el => extractRow(el, ''));
+      const allKeys = new Set();
+      rawRows.forEach(r => Object.keys(r).forEach(k => allKeys.add(k)));
+      const columns = [];
+      for (const key of allKeys) {
+        const values = rawRows.map(r => r[key] || '');
+        const filled = values.filter(v => v).length;
+        const fillRate = filled / rawRows.length;
+        if (fillRate < 0.2) continue;
+        const unique = new Set(values.filter(v => v));
+        if (unique.size <= 1 && rawRows.length > 2) continue;
+        const parts = key.split('/').filter(Boolean);
+        const last = parts[parts.length - 1] || key;
+        let name = last.replace(/^[a-z]+\\./, '').replace(/ (href|src)$/, ' $1').replace(/\\./g, ' ').trim() || last;
+        columns.push({ name, path: key, fillRate: Math.round(fillRate * 100) / 100 });
+      }
+      const nameCount = {};
+      columns.forEach(c => { nameCount[c.name] = (nameCount[c.name] || 0) + 1; });
+      const nameSeen = {};
+      columns.forEach(c => {
+        if (nameCount[c.name] > 1) {
+          nameSeen[c.name] = (nameSeen[c.name] || 0) + 1;
+          if (nameSeen[c.name] > 1) c.name = c.name + ' ' + nameSeen[c.name];
+        }
+      });
+      const rows = rawRows.map(raw => {
+        const row = {};
+        columns.forEach(c => { row[c.name] = raw[c.path] || ''; });
+        return row;
+      });
+      return { selector: ${JSON.stringify(sel)}, columns, rows, totalRows, truncated: totalRows > ${maxRowsPerTable} };
+    })()`,
+          }, TOOL_TIMEOUTS.extract_table) as { result?: Record<string, unknown> };
+
+          const extraction = (extractResult as { result?: { columns?: unknown[]; rows?: unknown[] } })?.result;
+          if (extraction && (extraction.columns?.length ?? 0) >= 2 && (extraction.rows?.length ?? 0) >= 2) {
+            tables.push(extraction);
+          }
+        }
+
+        // Extract JSON-LD
+        const jsonLdResult = await bridge.send({
+          type: "browser_evaluate",
+          expression: `(() => {
+      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+      const result = [];
+      scripts.forEach(s => { try { result.push(JSON.parse(s.textContent)); } catch {} });
+      return result;
+    })()`,
+        }, 5000) as { result?: unknown[] };
+
+        return toolSuccess({
+          tables,
+          structuredData: (jsonLdResult as { result?: unknown[] })?.result ?? [],
+          url,
+        });
+      },
+    },
   ];
 }
 
@@ -2644,6 +3066,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
 const COMPARISON_DIMENSIONS = [
   "framework", "performance", "security", "seo", "accessibility",
   "error-surface", "third-party-load", "architecture", "content-delivery", "mobile-readiness",
+  "data-structure",
 ] as const;
 
 function observeField(data: PageEvidence & { gaps?: CoverageGap[] }, dimension: string): Observation {
@@ -2690,6 +3113,10 @@ function observeField(data: PageEvidence & { gaps?: CoverageGap[] }, dimension: 
         ? { type: mr.hasViewportMeta ? "present" : "degraded", dimension, value: mr }
         : { type: "absent", dimension, gap: data.gaps?.find(g => g.dimension === "mobile-readiness") ?? { dimension, reason: "Mobile readiness data unavailable", impact: "data-absent", reducesConfidence: false } };
     }
+    case "data-structure":
+      return (data.meta?._structuredData?.length ?? 0) > 0
+        ? { type: "present", dimension, value: { structuredDataCount: data.meta!._structuredData.length } }
+        : { type: "absent", dimension };
     default:
       return { type: "absent", dimension };
   }
@@ -3046,6 +3473,215 @@ async function buildSmartObject(bridge: WebSocketBridge): Promise<Record<string,
     sessionGaps = [];
   };
 
+  // --- Phase 11: Structured Data Extraction ---
+
+  smart.detectTables = async (opts?: { maxCandidates?: number }): Promise<TableCandidate[]> => {
+    const maxCandidates = opts?.maxCandidates ?? 5;
+    const result = await evaluate(`(() => {
+      function getClasses(el) {
+        return (el.className || '').toString().trim().split(/\\s+/).filter(c => c && !c.match(/\\d/));
+      }
+      function getMatchingChildren(parent) {
+        const children = [...parent.children].filter(c =>
+          !['SCRIPT','IMG','STYLE','SVG','NOSCRIPT'].includes(c.tagName) &&
+          c.textContent.trim().length > 0
+        );
+        if (children.length < 2) return [];
+        const freq = {};
+        children.forEach(c => {
+          const key = getClasses(c).sort().join(' ');
+          freq[key] = (freq[key] || 0) + 1;
+        });
+        const threshold = children.length / 2 - 2;
+        let patterns = Object.keys(freq).filter(k => k && freq[k] >= threshold);
+        if (!patterns.length) {
+          const indiv = {};
+          children.forEach(c => getClasses(c).forEach(cls => { indiv[cls] = (indiv[cls] || 0) + 1; }));
+          patterns = Object.keys(indiv).filter(k => indiv[k] >= threshold);
+        }
+        return children.filter(c => {
+          const cls = getClasses(c);
+          return patterns.some(p => p.split(' ').every(pc => !pc || cls.includes(pc)));
+        });
+      }
+      function buildSelector(el) {
+        const parts = [];
+        let node = el;
+        while (node && node !== document.body && node !== document.documentElement) {
+          let tag = node.tagName.toLowerCase();
+          if (node.id && !/\\d/.test(node.id)) tag += '#' + CSS.escape(node.id);
+          else if (node.className && typeof node.className === 'string') {
+            const cls = node.className.trim().split(/\\s+/).filter(Boolean).slice(0, 3);
+            if (cls.length) tag += '.' + cls.map(c => CSS.escape(c)).join('.');
+          }
+          parts.unshift(tag);
+          node = node.parentElement;
+        }
+        return parts.join(' > ');
+      }
+      const candidates = [];
+      document.querySelectorAll('body *').forEach(el => {
+        const w = el.offsetWidth, h = el.offsetHeight;
+        if (w < 100 || h < 50) return;
+        const matching = getMatchingChildren(el);
+        if (matching.length < 2) return;
+        const score = w * h * matching.length * matching.length;
+        const text = matching.map(c => c.textContent.trim()).join(' ').substring(0, 200);
+        candidates.push({ selector: buildSelector(el), score, rowCount: matching.length, sampleText: text, area: w * h });
+      });
+      candidates.sort((a, b) => b.score - a.score);
+      return candidates.slice(0, ${maxCandidates});
+    })()`) as { result: TableCandidate[] };
+    return result.result || [];
+  };
+
+  smart.extractTable = async (selector: string, opts?: { maxRows?: number }): Promise<TableExtraction> => {
+    const maxRows = opts?.maxRows ?? 200;
+    const result = await evaluate(`(() => {
+      function getClasses(el) {
+        return (el.className || '').toString().trim().split(/\\s+/).filter(c => c && !c.match(/\\d/));
+      }
+      function getMatchingChildren(parent) {
+        const children = [...parent.children].filter(c =>
+          !['SCRIPT','IMG','STYLE','SVG','NOSCRIPT'].includes(c.tagName) &&
+          c.textContent.trim().length > 0
+        );
+        if (children.length < 2) return [];
+        const freq = {};
+        children.forEach(c => {
+          const key = getClasses(c).sort().join(' ');
+          freq[key] = (freq[key] || 0) + 1;
+        });
+        const threshold = children.length / 2 - 2;
+        let patterns = Object.keys(freq).filter(k => k && freq[k] >= threshold);
+        if (!patterns.length) {
+          const indiv = {};
+          children.forEach(c => getClasses(c).forEach(cls => { indiv[cls] = (indiv[cls] || 0) + 1; }));
+          patterns = Object.keys(indiv).filter(k => indiv[k] >= threshold);
+        }
+        return children.filter(c => {
+          const cls = getClasses(c);
+          return patterns.some(p => p.split(' ').every(pc => !pc || cls.includes(pc)));
+        });
+      }
+      function directText(el) {
+        let text = '';
+        for (const n of el.childNodes) {
+          if (n.nodeType === 3) text += n.textContent;
+        }
+        return text.trim();
+      }
+      function extractRow(el, prefix) {
+        const data = {};
+        const tag = el.tagName.toLowerCase();
+        const cls = getClasses(el).slice(0, 2).join('.');
+        const key = prefix + '/' + (cls ? tag + '.' + cls : tag);
+        const dt = directText(el);
+        if (dt) data[key] = dt;
+        if (el.href) data[key + ' href'] = el.href;
+        if (el.src) data[key + ' src'] = el.src;
+        for (const child of el.children) {
+          Object.assign(data, extractRow(child, key));
+        }
+        return data;
+      }
+      const container = document.querySelector(${JSON.stringify(selector)});
+      if (!container) return { selector: ${JSON.stringify(selector)}, columns: [], rows: [], totalRows: 0, truncated: false };
+      const matching = getMatchingChildren(container);
+      const totalRows = matching.length;
+      const limited = matching.slice(0, ${maxRows});
+      const rawRows = limited.map(el => extractRow(el, ''));
+      // Collect all keys
+      const allKeys = new Set();
+      rawRows.forEach(r => Object.keys(r).forEach(k => allKeys.add(k)));
+      // Build columns: filter sparse + constant
+      const columns = [];
+      const keyToName = {};
+      for (const key of allKeys) {
+        const values = rawRows.map(r => r[key] || '');
+        const filled = values.filter(v => v).length;
+        const fillRate = filled / rawRows.length;
+        if (fillRate < 0.2) continue;
+        // Drop constant columns
+        const unique = new Set(values.filter(v => v));
+        if (unique.size <= 1 && rawRows.length > 2) continue;
+        // Smart name: shortest class or last path segment
+        const parts = key.split('/').filter(Boolean);
+        const last = parts[parts.length - 1] || key;
+        let name = last.replace(/^[a-z]+\\./, '').replace(/ (href|src)$/, ' $1').replace(/\\./g, ' ').trim() || last;
+        keyToName[key] = name;
+        columns.push({ name, path: key, fillRate: Math.round(fillRate * 100) / 100 });
+      }
+      // Deduplicate names
+      const nameCount = {};
+      columns.forEach(c => { nameCount[c.name] = (nameCount[c.name] || 0) + 1; });
+      const nameSeen = {};
+      columns.forEach(c => {
+        if (nameCount[c.name] > 1) {
+          nameSeen[c.name] = (nameSeen[c.name] || 0) + 1;
+          if (nameSeen[c.name] > 1) c.name = c.name + ' ' + nameSeen[c.name];
+        }
+      });
+      // Build final rows
+      const rows = rawRows.map(raw => {
+        const row = {};
+        columns.forEach(c => { row[c.name] = raw[c.path] || ''; });
+        return row;
+      });
+      return { selector: ${JSON.stringify(selector)}, columns, rows, totalRows, truncated: totalRows > ${maxRows} };
+    })()`) as { result: TableExtraction };
+    return result.result || { selector, columns: [], rows: [], totalRows: 0, truncated: false };
+  };
+
+  smart.waitForNetworkIdle = async (opts?: { timeout?: number; idleTime?: number }): Promise<NetworkIdleResult> => {
+    const timeout = Math.min(opts?.timeout ?? 15000, 30000);
+    const idleTime = Math.min(opts?.idleTime ?? 500, 5000);
+    const result = await bridge.send({
+      type: "wait_for_network_idle",
+      timeout,
+      idleTime,
+    }, timeout + 5000);
+    return result as NetworkIdleResult;
+  };
+
+  smart.extractData = async (opts?: { maxTables?: number; maxRowsPerTable?: number }): Promise<DataExtraction> => {
+    const maxTables = opts?.maxTables ?? 3;
+    const maxRowsPerTable = opts?.maxRowsPerTable ?? 200;
+
+    // Get current URL
+    const status = await bridge.send({ type: "get_connection_status" }, 5000) as { connectedTab?: { url?: string } };
+    const url = status?.connectedTab?.url || "";
+
+    // Detect tables
+    const candidates = await (smart.detectTables as (opts?: { maxCandidates?: number }) => Promise<TableCandidate[]>)({ maxCandidates: maxTables });
+
+    // Extract each candidate
+    const tables: TableExtraction[] = [];
+    for (const candidate of candidates) {
+      const extraction = await (smart.extractTable as (selector: string, opts?: { maxRows?: number }) => Promise<TableExtraction>)(
+        candidate.selector, { maxRows: maxRowsPerTable }
+      );
+      // Filter noise: require at least 2 columns and 2 rows
+      if (extraction.columns.length >= 2 && extraction.rows.length >= 2) {
+        tables.push(extraction);
+      }
+    }
+
+    // Extract JSON-LD structured data
+    const jsonLd = await evaluate(`(() => {
+      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+      const result = [];
+      scripts.forEach(s => { try { result.push(JSON.parse(s.textContent)); } catch {} });
+      return result;
+    })()`) as { result: unknown[] };
+
+    return {
+      tables,
+      structuredData: jsonLd.result || [],
+      url,
+    };
+  };
+
   smart.scrollCapture = async (opts?: {
     maxSections?: number;
     pixelsPerScroll?: number;
@@ -3271,8 +3907,7 @@ function buildCatalog(tools: Tool[]): CatalogEntry[] {
 /**
  * Hybrid search: semantic similarity + keyword scoring.
  *
- * PiecesOS uses pure vector similarity (search_simd.rs).
- * Crawlio-agent adds keyword scoring as a second signal because:
+ * Keyword scoring as a second signal because:
  * - Tool names are highly structured (not natural language)
  * - Exact name matches should always rank highest
  * - Keyword scoring is the proven fallback when embeddings unavailable
@@ -3409,6 +4044,10 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
         "  smart.finding({ claim, evidence, sourceUrl, confidence, method, dimension? }) — create validated Finding, accumulate in session. Confidence auto-capped if dimension has active gap with reducesConfidence.",
         "  smart.findings() — return all accumulated Finding[] from current session.",
         "  smart.clearFindings() — reset accumulated findings and session gaps.",
+        "  smart.detectTables(opts?) — find repeating data patterns in the page. Returns TableCandidate[] (selector, score, rowCount, sampleText). Uses class-frequency scoring.",
+        "  smart.extractTable(selector, opts?) — extract structured data from a container. Returns { columns, rows, totalRows, truncated }. opts: { maxRows: 200 }.",
+        "  smart.waitForNetworkIdle(opts?) — wait for all network requests to settle (CDP-level, catches fetch/XHR/images/CSS/fonts). Returns { status, elapsed }. opts: { timeout: 15000, idleTime: 500 }.",
+        "  smart.extractData(opts?) — compound: detectTables + extractTable + JSON-LD. Returns { tables, structuredData, url }.",
         "  Framework namespaces (injected based on detected framework):",
         "  smart.react.{getVersion,getRootCount,hasProfiler,isHookInstalled}",
         "  smart.vue.{getVersion,getAppCount,getConfig,isDevMode}",

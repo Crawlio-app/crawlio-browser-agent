@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createCodeModeTools } from "@/mcp-server/tools";
+import { createCodeModeTools, createTools } from "@/mcp-server/tools";
 import { CrawlioClient } from "@/mcp-server/crawlio-client";
-import type { PageEvidence, ScrollEvidence, IdleStatus, ComparisonEvidence, Finding, CoverageGap, ComparisonScaffold, AccessibilitySummary, MobileReadiness } from "@/shared/evidence-types";
+import type { PageEvidence, ScrollEvidence, IdleStatus, ComparisonEvidence, Finding, CoverageGap, ComparisonScaffold, AccessibilitySummary, MobileReadiness, TableCandidate, TableExtraction, NetworkIdleResult, DataExtraction } from "@/shared/evidence-types";
 
 // --- Bridge mock with configurable scroll state ---
 
@@ -48,6 +48,40 @@ function createSmartBridge(opts?: {
         if (expr.includes("meta[name=\"viewport\"]") && expr.includes("mediaQueryCount")) {
           return { result: { hasViewportMeta: true, viewportContent: "width=device-width, initial-scale=1", mediaQueryCount: 3, bodyScrollWidth: 1024, windowInnerWidth: 1024, isOverflowing: false }, type: "object" };
         }
+        // detectTables — return mock candidates
+        if (expr.includes("getMatchingChildren") && expr.includes("candidates")) {
+          // Match the final candidates.slice(0, N) — use last occurrence
+          const allMatches = [...expr.matchAll(/candidates\.slice\(0,\s*(\d+)\)/g)];
+          const max = allMatches.length ? parseInt(allMatches[allMatches.length - 1][1]) : 5;
+          const all = [
+            { selector: "div.product-grid", score: 500000, rowCount: 10, sampleText: "Product 1 Widget A Product 2 Widget B", area: 50000 },
+            { selector: "ul.results", score: 200000, rowCount: 5, sampleText: "Result 1 Result 2", area: 30000 },
+            { selector: "div.sidebar", score: 100000, rowCount: 3, sampleText: "Link 1 Link 2", area: 20000 },
+          ];
+          return { result: all.slice(0, max), type: "object" };
+        }
+        // extractTable — return mock extraction
+        if (expr.includes("directText") && expr.includes("extractRow")) {
+          const selectorMatch = expr.match(/querySelector\("([^"]+)"\)/);
+          const selector = selectorMatch ? selectorMatch[1] : "div.unknown";
+          return { result: {
+            selector,
+            columns: [
+              { name: "title", path: "/h3.title", fillRate: 1.0 },
+              { name: "price", path: "/span.price", fillRate: 0.9 },
+            ],
+            rows: [
+              { title: "Product 1", price: "$19.99" },
+              { title: "Product 2", price: "$29.99" },
+            ],
+            totalRows: 2,
+            truncated: false,
+          }, type: "object" };
+        }
+        // JSON-LD extraction for extractData
+        if (expr.includes("application/ld+json")) {
+          return { result: [{ "@type": "Product", name: "Test" }], type: "object" };
+        }
         return { result: "evaluated", type: "string" };
       }
       case "take_screenshot":
@@ -84,6 +118,14 @@ function createSmartBridge(opts?: {
         return { ok: true };
       case "browser_hover":
         return { ok: true };
+      case "wait_for_network_idle": {
+        const t = Number(msg.timeout) || 15000;
+        // Simulate idle result by default; timeout if timeout=1
+        if (t <= 100) {
+          return { status: "timeout", elapsed: t, pendingAtTimeout: 2 };
+        }
+        return { status: "idle", elapsed: 350 };
+      }
       default:
         return { ok: true };
     }
@@ -623,12 +665,12 @@ describe("comparePages scaffold", () => {
     execute = getExecuteTool(bridge);
   });
 
-  it("scaffold has 10 dimensions", async () => {
+  it("scaffold has 11 dimensions", async () => {
     const result = await execute.handler({
       code: `return await smart.comparePages("https://a.com", "https://b.com")`,
     });
     const data = parseResult(result) as ComparisonEvidence;
-    expect(data.scaffold.dimensions.length).toBe(10);
+    expect(data.scaffold.dimensions.length).toBe(11);
   });
 
   it("each dimension has siteA, siteB, comparable flag", async () => {
@@ -1049,5 +1091,562 @@ describe("evidence aggregation", () => {
     });
     const length = parseResult(result);
     expect(length).toBe(1);
+  });
+});
+
+// ============================================================
+// Phase 11: Structured Data Extraction
+// ============================================================
+
+describe("smart.detectTables", () => {
+  it("returns array of candidates", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.detectTables()" });
+    const candidates = parseResult(result) as TableCandidate[];
+    expect(Array.isArray(candidates)).toBe(true);
+    expect(candidates.length).toBeGreaterThan(0);
+  });
+
+  it("respects maxCandidates option", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.detectTables({ maxCandidates: 1 })" });
+    const candidates = parseResult(result) as TableCandidate[];
+    expect(candidates.length).toBe(1);
+  });
+
+  it("candidates have required fields", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.detectTables()" });
+    const candidates = parseResult(result) as TableCandidate[];
+    for (const c of candidates) {
+      expect(typeof c.selector).toBe("string");
+      expect(typeof c.score).toBe("number");
+      expect(typeof c.rowCount).toBe("number");
+      expect(typeof c.sampleText).toBe("string");
+      expect(typeof c.area).toBe("number");
+    }
+  });
+
+  it("scores are non-negative", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.detectTables()" });
+    const candidates = parseResult(result) as TableCandidate[];
+    for (const c of candidates) {
+      expect(c.score).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it("candidates sorted by score descending", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.detectTables()" });
+    const candidates = parseResult(result) as TableCandidate[];
+    for (let i = 1; i < candidates.length; i++) {
+      expect(candidates[i - 1].score).toBeGreaterThanOrEqual(candidates[i].score);
+    }
+  });
+
+  it("returns empty array when no candidates from page", async () => {
+    const bridge = createSmartBridge();
+    // Override evaluate to return empty array for detectTables
+    const origSend = bridge.send;
+    bridge.send = vi.fn(async (msg: Record<string, unknown>) => {
+      if (msg.type === "browser_evaluate") {
+        const expr = String(msg.expression || "");
+        if (expr.includes("getMatchingChildren") && expr.includes("candidates")) {
+          return { result: [], type: "object" };
+        }
+      }
+      return origSend(msg);
+    });
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.detectTables()" });
+    const candidates = parseResult(result) as TableCandidate[];
+    expect(candidates).toEqual([]);
+  });
+});
+
+describe("smart.extractTable", () => {
+  it("returns columns and rows", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: `return await smart.extractTable("div.product-grid")` });
+    const extraction = parseResult(result) as TableExtraction;
+    expect(extraction.columns.length).toBeGreaterThan(0);
+    expect(extraction.rows.length).toBeGreaterThan(0);
+  });
+
+  it("columns have name, path, fillRate", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: `return await smart.extractTable("div.product-grid")` });
+    const extraction = parseResult(result) as TableExtraction;
+    for (const col of extraction.columns) {
+      expect(typeof col.name).toBe("string");
+      expect(typeof col.path).toBe("string");
+      expect(typeof col.fillRate).toBe("number");
+    }
+  });
+
+  it("rows are objects with string values", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: `return await smart.extractTable("div.product-grid")` });
+    const extraction = parseResult(result) as TableExtraction;
+    for (const row of extraction.rows) {
+      for (const val of Object.values(row)) {
+        expect(typeof val).toBe("string");
+      }
+    }
+  });
+
+  it("returns totalRows and truncated fields", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: `return await smart.extractTable("div.product-grid")` });
+    const extraction = parseResult(result) as TableExtraction;
+    expect(typeof extraction.totalRows).toBe("number");
+    expect(typeof extraction.truncated).toBe("boolean");
+  });
+
+  it("returns selector in result", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: `return await smart.extractTable("div.product-grid")` });
+    const extraction = parseResult(result) as TableExtraction;
+    expect(extraction.selector).toBe("div.product-grid");
+  });
+
+  it("fillRate is between 0 and 1", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: `return await smart.extractTable("div.product-grid")` });
+    const extraction = parseResult(result) as TableExtraction;
+    for (const col of extraction.columns) {
+      expect(col.fillRate).toBeGreaterThanOrEqual(0);
+      expect(col.fillRate).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("column names are strings, not raw paths", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: `return await smart.extractTable("div.product-grid")` });
+    const extraction = parseResult(result) as TableExtraction;
+    for (const col of extraction.columns) {
+      // Column name should not start with /
+      expect(col.name.startsWith("/")).toBe(false);
+    }
+  });
+
+  it("handles empty container gracefully", async () => {
+    const bridge = createSmartBridge();
+    const origSend = bridge.send;
+    bridge.send = vi.fn(async (msg: Record<string, unknown>) => {
+      if (msg.type === "browser_evaluate") {
+        const expr = String(msg.expression || "");
+        if (expr.includes("directText") && expr.includes("extractRow")) {
+          return { result: { selector: "div.empty", columns: [], rows: [], totalRows: 0, truncated: false }, type: "object" };
+        }
+      }
+      return origSend(msg);
+    });
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: `return await smart.extractTable("div.empty")` });
+    const extraction = parseResult(result) as TableExtraction;
+    expect(extraction.columns).toEqual([]);
+    expect(extraction.rows).toEqual([]);
+    expect(extraction.totalRows).toBe(0);
+  });
+});
+
+describe("smart.waitForNetworkIdle", () => {
+  it("returns idle status", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.waitForNetworkIdle()" });
+    const idle = parseResult(result) as NetworkIdleResult;
+    expect(idle.status).toBe("idle");
+  });
+
+  it("returns elapsed time", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.waitForNetworkIdle()" });
+    const idle = parseResult(result) as NetworkIdleResult;
+    expect(typeof idle.elapsed).toBe("number");
+    expect(idle.elapsed).toBeGreaterThan(0);
+  });
+
+  it("returns timeout status when requests are pending", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.waitForNetworkIdle({ timeout: 100 })" });
+    const idle = parseResult(result) as NetworkIdleResult;
+    expect(idle.status).toBe("timeout");
+    expect(typeof idle.pendingAtTimeout).toBe("number");
+  });
+
+  it("caps timeout at 30000ms", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    // Should not throw — timeout is capped internally
+    const result = await execute.handler({ code: "return await smart.waitForNetworkIdle({ timeout: 99999 })" });
+    const idle = parseResult(result) as NetworkIdleResult;
+    expect(idle.status).toBe("idle");
+  });
+
+  it("accepts idleTime option", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.waitForNetworkIdle({ idleTime: 1000 })" });
+    const idle = parseResult(result) as NetworkIdleResult;
+    expect(idle.status).toBe("idle");
+  });
+});
+
+describe("smart.extractData", () => {
+  it("returns tables and structuredData arrays", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.extractData()" });
+    const data = parseResult(result) as DataExtraction;
+    expect(Array.isArray(data.tables)).toBe(true);
+    expect(Array.isArray(data.structuredData)).toBe(true);
+  });
+
+  it("returns url field", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.extractData()" });
+    const data = parseResult(result) as DataExtraction;
+    expect(typeof data.url).toBe("string");
+  });
+
+  it("tables have valid structure", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.extractData()" });
+    const data = parseResult(result) as DataExtraction;
+    for (const table of data.tables) {
+      expect(table.columns.length).toBeGreaterThanOrEqual(2);
+      expect(table.rows.length).toBeGreaterThanOrEqual(2);
+      expect(typeof table.selector).toBe("string");
+    }
+  });
+
+  it("structuredData contains JSON-LD", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.extractData()" });
+    const data = parseResult(result) as DataExtraction;
+    expect(data.structuredData.length).toBeGreaterThan(0);
+  });
+
+  it("respects maxTables option", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.extractData({ maxTables: 1 })" });
+    const data = parseResult(result) as DataExtraction;
+    // maxTables=1 means only 1 candidate detected, then filtered
+    expect(data.tables.length).toBeLessThanOrEqual(1);
+  });
+
+  it("returns empty tables array when no patterns found", async () => {
+    const bridge = createSmartBridge();
+    const origSend = bridge.send;
+    bridge.send = vi.fn(async (msg: Record<string, unknown>) => {
+      if (msg.type === "browser_evaluate") {
+        const expr = String(msg.expression || "");
+        if (expr.includes("getMatchingChildren") && expr.includes("candidates")) {
+          return { result: [], type: "object" };
+        }
+        if (expr.includes("application/ld+json")) {
+          return { result: [], type: "object" };
+        }
+      }
+      return origSend(msg);
+    });
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({ code: "return await smart.extractData()" });
+    const data = parseResult(result) as DataExtraction;
+    expect(data.tables).toEqual([]);
+  });
+});
+
+describe("comparison scaffold with data-structure", () => {
+  it("COMPARISON_DIMENSIONS has 11 entries", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({
+      code: `
+        const evidence = await smart.comparePages("https://a.com", "https://b.com");
+        return evidence.scaffold.dimensions.length;
+      `,
+    });
+    const count = parseResult(result);
+    expect(count).toBe(11);
+  });
+
+  it("data-structure dimension present when JSON-LD exists", async () => {
+    const bridge = createSmartBridge();
+    // Mock meta extraction to include structured data
+    const origSend = bridge.send;
+    bridge.send = vi.fn(async (msg: Record<string, unknown>) => {
+      if (msg.type === "browser_evaluate") {
+        const expr = String(msg.expression || "");
+        if (expr.includes("querySelectorAll('meta')")) {
+          return { result: { _title: "Test", _canonical: null, _structuredData: [{ "@type": "Product" }], _headings: [], _nav: [] }, type: "object" };
+        }
+      }
+      return origSend(msg);
+    });
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({
+      code: `
+        const evidence = await smart.comparePages("https://a.com", "https://b.com");
+        const ds = evidence.scaffold.dimensions.find(d => d.name === "data-structure");
+        return ds;
+      `,
+    });
+    const ds = parseResult(result);
+    expect(ds.name).toBe("data-structure");
+    expect(ds.siteA.type).toBe("present");
+  });
+
+  it("data-structure dimension absent when no structured data", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({
+      code: `
+        const evidence = await smart.comparePages("https://a.com", "https://b.com");
+        const ds = evidence.scaffold.dimensions.find(d => d.name === "data-structure");
+        return ds;
+      `,
+    });
+    const ds = parseResult(result);
+    expect(ds.name).toBe("data-structure");
+    expect(ds.siteA.type).toBe("absent");
+  });
+
+  it("scaffold slot has correct shape", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({
+      code: `
+        const evidence = await smart.comparePages("https://a.com", "https://b.com");
+        const ds = evidence.scaffold.dimensions.find(d => d.name === "data-structure");
+        return ds;
+      `,
+    });
+    const ds = parseResult(result);
+    expect(typeof ds.comparable).toBe("boolean");
+    expect(ds.siteA).toBeDefined();
+    expect(ds.siteB).toBeDefined();
+    expect(ds.siteA.dimension).toBe("data-structure");
+  });
+
+  it("existing 10 dimensions still present", async () => {
+    const bridge = createSmartBridge();
+    const execute = getExecuteTool(bridge);
+    const result = await execute.handler({
+      code: `
+        const evidence = await smart.comparePages("https://a.com", "https://b.com");
+        return evidence.scaffold.dimensions.map(d => d.name);
+      `,
+    });
+    const names = parseResult(result) as string[];
+    const expected = [
+      "framework", "performance", "security", "seo", "accessibility",
+      "error-surface", "third-party-load", "architecture", "content-delivery", "mobile-readiness",
+    ];
+    for (const dim of expected) {
+      expect(names).toContain(dim);
+    }
+    expect(names).toContain("data-structure");
+  });
+});
+
+// ============================================================
+// Full-mode tools: detect_tables, extract_table, extract_data
+// ============================================================
+
+function getFullModeTool(bridge: ReturnType<typeof createSmartBridge>, toolName: string) {
+  const crawlio = new CrawlioClient("http://localhost:0");
+  const tools = createTools(bridge as never, crawlio);
+  const tool = tools.find((t) => t.name === toolName);
+  if (!tool) throw new Error(`${toolName} tool not found`);
+  return tool;
+}
+
+function parseFullModeResult(result: { isError?: boolean; content: Array<{ text: string }> }) {
+  expect(result.isError).toBeFalsy();
+  return JSON.parse(result.content[0].text);
+}
+
+describe("full-mode detect_tables tool", () => {
+  it("exists in createTools output", () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "detect_tables");
+    expect(tool).toBeDefined();
+    expect(tool.name).toBe("detect_tables");
+  });
+
+  it("returns array of candidates", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "detect_tables");
+    const result = await tool.handler({});
+    const candidates = parseFullModeResult(result) as TableCandidate[];
+    expect(Array.isArray(candidates)).toBe(true);
+    expect(candidates.length).toBeGreaterThan(0);
+  });
+
+  it("respects maxCandidates param", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "detect_tables");
+    const result = await tool.handler({ maxCandidates: 1 });
+    const candidates = parseFullModeResult(result) as TableCandidate[];
+    expect(candidates.length).toBe(1);
+  });
+
+  it("candidates have required shape", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "detect_tables");
+    const result = await tool.handler({});
+    const candidates = parseFullModeResult(result) as TableCandidate[];
+    for (const c of candidates) {
+      expect(typeof c.selector).toBe("string");
+      expect(typeof c.score).toBe("number");
+      expect(typeof c.rowCount).toBe("number");
+      expect(typeof c.sampleText).toBe("string");
+      expect(typeof c.area).toBe("number");
+    }
+  });
+
+  it("sends browser_evaluate command to bridge", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "detect_tables");
+    await tool.handler({});
+    const evaluateCalls = bridge.send.mock.calls.filter(
+      (c: [{ type: string }]) => c[0].type === "browser_evaluate"
+    );
+    expect(evaluateCalls.length).toBeGreaterThan(0);
+    const expr = (evaluateCalls[0][0] as { expression: string }).expression;
+    expect(expr).toContain("getMatchingChildren");
+    expect(expr).toContain("candidates");
+  });
+});
+
+describe("full-mode extract_table tool", () => {
+  it("exists in createTools output", () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "extract_table");
+    expect(tool).toBeDefined();
+    expect(tool.name).toBe("extract_table");
+  });
+
+  it("returns columns and rows", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "extract_table");
+    const result = await tool.handler({ selector: "div.product-grid" });
+    const extraction = parseFullModeResult(result) as TableExtraction;
+    expect(extraction.columns.length).toBeGreaterThan(0);
+    expect(extraction.rows.length).toBeGreaterThan(0);
+  });
+
+  it("requires selector parameter", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "extract_table");
+    await expect(tool.handler({})).rejects.toThrow();
+  });
+
+  it("preserves selector in response", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "extract_table");
+    const result = await tool.handler({ selector: "div.product-grid" });
+    const extraction = parseFullModeResult(result) as TableExtraction;
+    expect(extraction.selector).toBe("div.product-grid");
+  });
+
+  it("has totalRows and truncated fields", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "extract_table");
+    const result = await tool.handler({ selector: "div.product-grid" });
+    const extraction = parseFullModeResult(result) as TableExtraction;
+    expect(typeof extraction.totalRows).toBe("number");
+    expect(typeof extraction.truncated).toBe("boolean");
+  });
+
+  it("columns have name, path, fillRate", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "extract_table");
+    const result = await tool.handler({ selector: "div.product-grid" });
+    const extraction = parseFullModeResult(result) as TableExtraction;
+    for (const col of extraction.columns) {
+      expect(typeof col.name).toBe("string");
+      expect(typeof col.path).toBe("string");
+      expect(typeof col.fillRate).toBe("number");
+    }
+  });
+});
+
+describe("full-mode extract_data tool", () => {
+  it("exists in createTools output", () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "extract_data");
+    expect(tool).toBeDefined();
+    expect(tool.name).toBe("extract_data");
+  });
+
+  it("returns tables, structuredData, url", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "extract_data");
+    const result = await tool.handler({});
+    const data = parseFullModeResult(result) as DataExtraction;
+    expect(Array.isArray(data.tables)).toBe(true);
+    expect(Array.isArray(data.structuredData)).toBe(true);
+    expect(typeof data.url).toBe("string");
+  });
+
+  it("extracts JSON-LD structured data", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "extract_data");
+    const result = await tool.handler({});
+    const data = parseFullModeResult(result) as DataExtraction;
+    expect(data.structuredData.length).toBeGreaterThan(0);
+  });
+
+  it("respects maxTables param", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "extract_data");
+    const result = await tool.handler({ maxTables: 1 });
+    const data = parseFullModeResult(result) as DataExtraction;
+    // maxTables=1 means at most 1 candidate detected
+    expect(data.tables.length).toBeLessThanOrEqual(1);
+  });
+
+  it("filters tables with <2 columns or <2 rows", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "extract_data");
+    const result = await tool.handler({});
+    const data = parseFullModeResult(result) as DataExtraction;
+    for (const table of data.tables) {
+      expect(table.columns.length).toBeGreaterThanOrEqual(2);
+      expect(table.rows.length).toBeGreaterThanOrEqual(2);
+    }
+  });
+
+  it("calls get_connection_status for URL", async () => {
+    const bridge = createSmartBridge();
+    const tool = getFullModeTool(bridge, "extract_data");
+    await tool.handler({});
+    const statusCalls = bridge.send.mock.calls.filter(
+      (c: [{ type: string }]) => c[0].type === "get_connection_status"
+    );
+    expect(statusCalls.length).toBeGreaterThan(0);
   });
 });

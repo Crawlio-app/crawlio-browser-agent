@@ -1,6 +1,6 @@
 ---
 name: browser-automation
-description: Use this skill when the user asks to interact with a browser, take screenshots, inspect a page, capture network traffic, detect frameworks, click elements, fill forms, record browser sessions, or automate any browser task. Orchestrates crawlio-agent's 96 browser tools via the search + execute + connect_tab interface.
+description: Use this skill when the user asks to interact with a browser, take screenshots, inspect a page, capture network traffic, detect frameworks, click elements, fill forms, record browser sessions, or automate any browser task. Orchestrates crawlio-agent's 100 browser tools via the search + execute + connect_tab interface.
 allowed-tools: mcp__crawlio-browser__search, mcp__crawlio-browser__execute, mcp__crawlio-browser__connect_tab
 ---
 
@@ -308,7 +308,7 @@ When you don't know the exact command, search first:
 search({ query: "cookies" })
 ```
 
-This returns matching command names, descriptions, and parameter schemas from the full catalog of 129 commands (96 browser + 33 desktop).
+This returns matching command names, descriptions, and parameter schemas from the full catalog of 133 commands (100 browser + 33 desktop).
 
 ## Desktop Integration (Crawlio App)
 
@@ -466,10 +466,22 @@ const page = await smart.extractPage()
 
 // Compare two pages — navigates to each, runs extractPage(), returns structured pair
 const diff = await smart.comparePages("https://a.com", "https://b.com")
+
+// Detect table-like structures in the DOM — returns scored candidates
+const tables = await smart.detectTables()
+
+// Extract data from a specific table element
+const data = await smart.extractTable("table.pricing")
+
+// Wait for network to become idle (no pending requests)
+const idle = await smart.waitForNetworkIdle(5000)
+
+// Compound extraction — detect tables + extract + network idle
+const extracted = await smart.extractData()
 ```
 
 For multi-page research protocols (competitive analysis, site audits), see the **web-research** skill.
 
 ## Reference
 
-See [reference.md](./reference.md) for the full list of all 96 browser commands and 33 desktop commands with parameters.
+See [reference.md](./reference.md) for the full list of all 100 browser commands and 33 desktop commands with parameters.

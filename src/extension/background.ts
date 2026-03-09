@@ -228,7 +228,7 @@ function classifyCDPError(error: unknown): CDPError {
   return CDPError.Unknown;
 }
 
-// Recovery cases from Playwright CDP patterns: disconnect→re-attach→retry, "already attached" swallow,
+// Recovery cases for CDP patterns: disconnect→re-attach→retry, "already attached" swallow,
 // "detached while handling" skip.
 async function sendCDPCommand<T>(
   target: chrome.debugger.Debuggee,
@@ -422,7 +422,7 @@ interface DomainEnableResult {
 
 const tabDomainState = new Map<number, DomainEnableResult>();
 
-// Tab-scoped keyboard state: pressed keys + modifier bitmask (Playwright Keyboard pattern)
+// Tab-scoped keyboard state: pressed keys + modifier bitmask
 interface KeyboardState {
   pressedKeys: Set<string>;
   modifiers: number;
@@ -1036,7 +1036,7 @@ function flushConsoleToStorage() {
 // H6: Double-setTimeout yield between CDP operations
 const CDP_YIELD = () => new Promise<void>(r => setTimeout(() => setTimeout(r, 20), 20));
 
-// === Semaphore / Mutex (ported from Playwright browser-agent background.js) ===
+// === Semaphore / Mutex ===
 // Semaphore/Mutex used by earlier versions for single-connection probe guards.
 
 interface SemaphoreWaiter {
@@ -1773,7 +1773,7 @@ function buildModifiers(opts: { ctrl?: boolean; alt?: boolean; shift?: boolean; 
   return (opts.alt ? 1 : 0) | (opts.ctrl ? 2 : 0) | (opts.meta ? 4 : 0) | (opts.shift ? 8 : 0);
 }
 
-// Playwright-matching modifier bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8
+// CDP modifier bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8
 function modifierBit(key: string): number {
   switch (key) {
     case "Alt": return 1;
@@ -1817,8 +1817,8 @@ async function dispatchClick(tabId: number, x: number, y: number, options: Mouse
   }, 0);
 }
 
-// Default: atomic Input.insertText (like Playwright's fill()) — no double-character bug on SPAs.
-// When slowly=true: per-character keyDown/char/keyUp (like Playwright's pressSequentially()).
+// Default: atomic Input.insertText — no double-character bug on SPAs.
+// When slowly=true: per-character keyDown/char/keyUp.
 async function dispatchType(tabId: number, text: string, modifiers = 0, slowly = false): Promise<void> {
   await ensureDebugger(tabId);
   if (!slowly) {
@@ -1855,7 +1855,7 @@ async function dispatchType(tabId: number, text: string, modifiers = 0, slowly =
   }
 }
 
-// Playwright-matching press: compound keys (Control+A), persistent state tracking
+// CDP key press: compound keys (Control+A), persistent state tracking
 async function dispatchKey(tabId: number, key: string, modifiers = 0): Promise<void> {
   await ensureDebugger(tabId);
   const state = getKeyState(tabId);
@@ -5511,6 +5511,36 @@ async function handleCommand(command: any): Promise<any> {
         }
         const snapshot = await generateAriaSnapshot(tab.id!);
         return { type: "response", id, success: true, data: { snapshot } };
+      }
+
+      case "wait_for_network_idle": {
+        const timeout = Math.min(Number(command.timeout) || 15000, 30000);
+        const idleTime = Math.min(Number(command.idleTime) || 500, 5000);
+        const start = Date.now();
+
+        const result = await new Promise<{ status: string; elapsed: number; pendingAtTimeout?: number }>((resolve) => {
+          let lastActivity = Date.now();
+
+          const check = () => {
+            const now = Date.now();
+            const pending = Array.from(networkEntries.values()).filter(e => e._startTime !== undefined).length;
+
+            if (pending === 0 && now - lastActivity >= idleTime) {
+              resolve({ status: "idle", elapsed: now - start });
+              return;
+            }
+            if (pending > 0) lastActivity = now;
+            if (now - start >= timeout) {
+              resolve({ status: "timeout", elapsed: now - start, pendingAtTimeout: pending });
+              return;
+            }
+            setTimeout(check, 100);
+          };
+          // Give the page a moment to start issuing requests
+          setTimeout(check, 200);
+        });
+
+        return { type: "response", id, success: true, data: result };
       }
 
       case "get_enrichment": {

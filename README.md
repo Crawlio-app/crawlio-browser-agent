@@ -1,37 +1,51 @@
 # Crawlio Agent
 
-MCP server that gives AI full control of a live Chrome browser via CDP. 96 tools (92 browser + 3 session recording + 1 compiler) with framework-aware intelligence — captures what static crawlers can't see.
-
 [![npm version](https://img.shields.io/npm/v/crawlio-browser)](https://www.npmjs.com/package/crawlio-browser)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+## [Documentation](https://docs.crawlio.app/browser-agent/overview) | [API Reference](https://docs.crawlio.app/browser-agent/tools) | [Chrome Extension](https://www.crawlio.app/browser-agent)
+
+MCP server that gives AI full control of a live Chrome browser via CDP. 100 tools (93 browser + 3 extraction + 3 recording + 1 compiler) with framework-aware intelligence, typed evidence infrastructure, and confidence-tracked findings — captures what static crawlers can't see.
+
+> **Note:** This repo supersedes [`crawlio-browser-mcp`](https://github.com/AshDevFr/crawlio-browser-mcp). All development now happens here.
 
 ## When to use Crawlio Agent
 
 Use Crawlio Agent when your AI needs to interact with a **real browser** — SPAs, authenticated pages, dynamic content, JS-rendered frameworks. Unlike headless browser tools, Crawlio Agent connects to **your actual Chrome** via a lightweight extension, giving the AI access to your logged-in sessions, cookies, and full browser state.
 
-**Crawlio Agent vs Playwright MCP:** Playwright MCP launches a headless browser. Crawlio Agent connects to your existing Chrome — no separate browser process, no login flows, full access to your tabs and sessions.
+**Crawlio Agent vs headless browser tools:** Headless tools launch a separate browser process. Crawlio Agent connects to your existing Chrome — no separate browser, no login flows, full access to your tabs and sessions.
 
 ## Quick Start
 
-1. Install the [Chrome Extension](https://crawlio.app/agent)
+1. Install the [Chrome Extension](https://www.crawlio.app/browser-agent)
 2. Run the init wizard:
    ```bash
    npx crawlio-browser init
    ```
 
-That's it. Auto-detects and configures Claude Code, Cursor, VS Code, Codex, Claude Desktop, ChatGPT Desktop, and 8 more MCP clients.
+That's it. Auto-detects and configures 14 MCP clients: Claude Code, Cursor, VS Code, Codex, Gemini CLI, Claude Desktop, ChatGPT Desktop, Windsurf, Cline, Zed, Goose, OpenCode, MCPorter, and Cline CLI.
 
 ### Init wizard options
 
 ```bash
 npx crawlio-browser init              # Default: code mode, stdio transport
-npx crawlio-browser init --full       # Full mode (96 individual tools)
+npx crawlio-browser init --full       # Full mode (100 individual tools)
 npx crawlio-browser init --portal     # Portal mode (persistent HTTP server)
 npx crawlio-browser init --cloudflare # Add Cloudflare MCP (89 tools, no wrangler)
 npx crawlio-browser init --dry-run    # Show what would happen
 npx crawlio-browser init --yes        # Skip prompts (CI / scripted installs)
 npx crawlio-browser init -a claude    # Target specific MCP client
 ```
+
+### Transport Modes
+
+| Mode | Command / URL | Protocol | Best For |
+|------|--------------|----------|----------|
+| **stdio** | `npx crawlio-browser` | JSON-RPC over stdin/stdout | Claude Desktop, Cursor, Windsurf — client manages process lifecycle |
+| **Portal (HTTP)** | `POST http://127.0.0.1:3001/mcp` | MCP Streamable HTTP | Claude Code, ChatGPT Desktop — server survives session restarts |
+| **Portal (SSE)** | `GET /sse` + `POST /message` | Server-Sent Events | Legacy clients needing SSE transport |
+
+Portal mode is recommended for Claude Code — the server persists across context compaction and session restarts. On macOS, `--portal` installs a launchd agent for auto-start on login.
 
 ### Manual setup (any client)
 
@@ -76,37 +90,131 @@ URL: `http://127.0.0.1:3001/mcp` | Type: Streamable HTTP
 ## How It Works
 
 ```
-AI Client (stdio)  -->  MCP Server (Node.js)  -->  Chrome Extension (MV3)
-                        crawlio-browser               WebSocket -> CDP
+AI Client (stdio/http)  -->  MCP Server (Node.js)  -->  Chrome Extension (MV3)
+                             crawlio-browser               WebSocket -> CDP
 ```
 
-The MCP server communicates with the Chrome extension via WebSocket. The extension controls the browser through Chrome DevTools Protocol — the same protocol used by Chrome DevTools and Playwright.
+The MCP server communicates with the Chrome extension via WebSocket. The extension controls the browser through Chrome DevTools Protocol (CDP).
+
+## Capabilities
+
+### Framework-Aware Intelligence
+
+Every `execute` call probes the browser for framework signatures and injects a shape-shifting `smart` object with framework-native accessors. React state, Vue reactivity, Next.js routing, Shopify cart data — 17 framework namespaces across 4 tiers, detected at runtime and rebuilt on every navigation. The AI doesn't query a generic DOM; it queries the framework's own data structures.
+
+### Evidence-Based Analysis
+
+Method Mode adds higher-order methods and a typed evidence system on top of Code Mode. `smart.extractPage()` runs 7 parallel operations in a single call — page capture, performance metrics, security state, font detection, meta extraction, accessibility audit, and mobile-readiness check. Failed operations produce typed `CoverageGap` records instead of silent `null`s. Findings created with `smart.finding()` get their confidence automatically adjusted when supporting data is missing. The result: structured, auditable research output with gap tracking and confidence propagation.
+
+### Session Recording & Replay
+
+Record browser interactions as structured data, then compile them into reusable SKILL.md automations. 12 interaction tools are automatically intercepted during recording — clicks, typing, navigation, scrolling — each capturing args, result, timing, and page URL. One `compileRecording()` call converts the session into a deterministic automation script.
+
+### Auto-Settling & Actionability
+
+Every mutative action (`click`, `type`, `navigate`, `select_option`) runs actionability checks before acting — polling visibility, dimensions, enabled state, and overlay detection. After the action, a progressive backoff settle delay (`[0, 20, 100, 100, 500]ms`) waits for DOM mutations to quiesce. The AI doesn't need manual `sleep()` calls between actions.
 
 ## Architecture: JIT Context Runtime
 
-The execution runtime is built on four pillars that separate it from stateless cloud sandboxes:
-
-- **Attention Dilution Cure** — 3 tools (`search`, `execute`, `connect_tab`) instead of 96. The agent discovers capabilities on demand through `search`, keeping the context window clean and tool selection accurate.
-- **Polymorphic Context** — Before code executes, the runtime probes the browser for framework signatures and injects a shape-shifting `smart` object with framework-native accessors (React, Vue, Next.js, Shopify, etc. — 17 namespaces across 4 tiers).
-- **Deterministic Execution** — Every `smart.click()` runs an actionability check (visibility, dimensions, enabled state, overlay detection) with progressive backoff, then enforces a post-action settle delay (500ms/300ms/1000ms).
-- **Agentic REPL** — The runtime maintains a persistent connection to the browser. When a script fails, the browser state is preserved — the agent reads the structured error and iterates against the same live session.
+The JIT Context MCP Runtime is a layered execution architecture where each layer absorbs a category of complexity that would otherwise fall on the model. The model sees three tools and a clean SDK. Everything beneath that surface is the runtime absorbing reality.
 
 ```
-execute call lifecycle:
-  search -> discover capabilities
-  detect -> probe DOM for active frameworks
-  inject -> build polymorphic smart object
-  run    -> execute with actionability checks + settle delays
-  return -> result or structured error (browser state preserved)
+                     ┌───────────────────────────────────┐
+                     │        AI Model (LLM)             │
+                     │  Writes code, reads errors, loops  │
+                     └───────────────┬───────────────────┘
+                                     │  3 tools: search, execute, connect_tab
+                                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    JIT Context MCP Runtime                       │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │  METHOD MODE                                               │  │
+│  │  Behavioral protocol + higher-order methods                │  │
+│  │  scrollCapture · waitForIdle · extractPage · comparePages  │  │
+│  │  detectTables · extractTable · waitForNetworkIdle ·        │  │
+│  │  extractData                                               │  │
+│  │                                                            │  │
+│  │  ↳ Absorbs: behavioral variance, ad-hoc composition,      │  │
+│  │    inconsistent output shapes, data extraction patterns    │  │
+│  ├────────────────────────────────────────────────────────────┤  │
+│  │  POLYMORPHIC CONTEXT                                       │  │
+│  │  17 framework namespaces, injected Just-In-Time            │  │
+│  │  react · vue · angular · nextjs · shopify · ...            │  │
+│  │                                                            │  │
+│  │  ↳ Absorbs: framework opacity, minified code,             │  │
+│  │    devtools hook complexity                                │  │
+│  ├────────────────────────────────────────────────────────────┤  │
+│  │  ACTIONABILITY ENGINE                                      │  │
+│  │  7 core smart methods with built-in resilience             │  │
+│  │  click · type · navigate · waitFor · evaluate ·            │  │
+│  │  snapshot · screenshot                                     │  │
+│  │                                                            │  │
+│  │  ↳ Absorbs: DOM timing, hydration delays, CSS animations, │  │
+│  │    disabled states, overlapping elements                   │  │
+│  ├────────────────────────────────────────────────────────────┤  │
+│  │  TETHERED IPC BRIDGE                                       │  │
+│  │  WebSocket ↔ Chrome extension, message queue,              │  │
+│  │  heartbeat, auto-reconnect, stale detection                │  │
+│  │                                                            │  │
+│  │  ↳ Absorbs: connection drops, tab refreshes,              │  │
+│  │    port conflicts, extension lifecycle                     │  │
+│  ├────────────────────────────────────────────────────────────┤  │
+│  │  133 RAW COMMANDS  (bridge.send)                           │  │
+│  │  CDP-level browser control via Chrome extension            │  │
+│  └────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+                     ┌───────────────────────────────────┐
+                     │         Live Chrome Browser        │
+                     │   Persistent session, real DOM,    │
+                     │   framework runtime, user state    │
+                     └───────────────────────────────────┘
 ```
 
-[Read the full architecture guide &rarr;](https://docs.crawlio.app/browser-agent/jit-context-runtime)
+### What Each Layer Absorbs
+
+| Layer | Without It | With It |
+|-------|-----------|---------|
+| **Tethered IPC Bridge** | Script crashes on tab refresh, pending commands lost on reconnect, port conflicts on startup | Resilient WebSocket with message queue (100-msg capacity), heartbeat stale detection (15s intervals), auto-reconnect with drain |
+| **Actionability Engine** | `click('#btn')` fires before the button renders, during CSS transitions, or while an overlay covers it | Progressive polling (exists → has dimensions → visible → not disabled → not obscured) with `[0, 20, 100, 100, 500]ms` backoff |
+| **Polymorphic Context** | Model sees minified `<div>` elements; reading React state requires knowing exact hook paths, renderer maps, and fiber root API | Runtime probes live JS environment, detects 17 frameworks, injects namespace methods (`smart.react.getVersion()`, `smart.nextjs.getData()`) |
+| **Method Mode** | Model composes primitives ad-hoc — inconsistent scroll loops, missed edge cases, varying return shapes | 8 tested methods encode correct patterns; behavioral protocol constrains workflow |
+
+### Execution Lifecycle
+
+1. **Discovery** — Model calls `search("page capture performance")` and gets documentation for relevant commands
+2. **Framework Detection** — Runtime probes the live DOM, detects active frameworks, constructs polymorphic `smart` object with appropriate namespaces
+3. **Scope Assembly** — Model's code is compiled into an async function with injected parameters: `bridge` (133 commands), `crawlio` (HTTP client), `sleep`, `TIMEOUTS`, `smart` (7 core + 8 higher-order + up to 17 framework namespaces), `compileRecording`
+4. **Execution** — Method Mode methods compose the lower layers: `extractPage()` fires 7 parallel `bridge.send()` calls; `click()` runs the actionability engine; `react.getVersion()` evaluates framework-specific expressions
+5. **Error Recovery (Agentic REPL)** — On failure, the browser stays in the exact state that produced the error. The model reads the structured error, adjusts, and calls `execute` again. Framework cache persists — no re-detection unless URL changed
+
+### Design Principles
+
+1. **Absorb complexity downward** — Every category of difficulty (connection management, DOM timing, framework detection, multi-step composition) is handled by the layer best equipped for it. The model only encounters the clean interface at the top.
+2. **Shape the SDK to the target** — The polymorphic context system detects what the page is and reshapes available methods to match. The model writes against a stable interface; the runtime adapts underneath.
+3. **Preserve state across cycles** — The tethered architecture means the model can fail, learn, and retry against the same live environment — transforming error handling from "restart from scratch" into "adjust and continue."
+
+### How It Compares
+
+| Dimension | Standard MCP | Cloudflare Code Mode | JIT Context Runtime |
+|-----------|-------------|---------------------|---------------------|
+| **Tools in context** | 50-100+ schemas | 2 (`search`, `execute`) | 3 (`search`, `execute`, `connect_tab`) |
+| **Execution environment** | N/A (tool calls) | V8 isolate (stateless) | Local async sandbox (stateful, tethered to live browser) |
+| **DOM access** | Via individual tool calls | None | Live, persistent, framework-aware |
+| **Framework awareness** | None | None | 17 namespaces, injected JIT |
+| **Action resilience** | Model must handle timing | N/A (no DOM) | Built-in actionability polling + settle delays |
+| **Error recovery** | Re-call individual tool | Re-create isolate | Re-execute against same live state (Agentic REPL) |
+| **Multi-step patterns** | Model improvises | Model writes loops | 8 tested higher-order methods + behavioral protocol |
+
+[Read the full architecture guide &rarr;](https://docs.crawlio.app/browser-agent/overview)
 
 ## Two Modes
 
 ### Code Mode (3 tools) — default
 
-Collapses 96 tools into 3 high-level tools with ~95% schema token reduction:
+Collapses 100 tools into 3 high-level tools with ~95% schema token reduction:
 
 | Tool | Description |
 |------|-------------|
@@ -122,7 +230,7 @@ const screenshot = await bridge.send({ type: 'take_screenshot' }, 10000);
 return screenshot;
 ```
 
-### Full Mode (96 tools)
+### Full Mode (100 tools)
 
 Every tool exposed directly to the LLM. Enable with `--full`:
 
@@ -144,27 +252,35 @@ In Code Mode, the `smart` object provides framework-aware helpers with auto-wait
 | `smart.navigate(url, opts?)` | Navigate with 1000ms settle |
 | `smart.waitFor(selector, timeout?)` | Poll until element is actionable |
 | `smart.snapshot()` | Accessibility tree snapshot |
+| `smart.screenshot()` | Full-page screenshot (base64 PNG) |
 
 ### Higher-Order Methods
 
 | Method | Description |
 |--------|-------------|
-| `smart.scrollCapture()` | Scroll to bottom, capturing content along the way |
-| `smart.waitForIdle()` | Wait for network + DOM to settle |
-| `smart.extractPage(opts?)` | Structured page evidence extraction (returns `PageEvidence`) |
-| `smart.comparePages(a, b)` | Diff two page snapshots across 10 dimensions (returns `ComparisonEvidence`) |
+| `smart.scrollCapture(opts?)` | Scroll to bottom, capturing screenshots at each position. Handles stuck-scroll detection, bottom detection, section capping, and scroll reset. |
+| `smart.waitForIdle(timeout?)` | MutationObserver-based idle detection — waits for 500ms quiet window. Timeout hard-capped at 15s. Replaces blind `sleep()` calls. |
+| `smart.extractPage(opts?)` | 7 parallel operations in one call — page capture, performance, security, fonts, meta, accessibility, mobile-readiness. Returns typed `PageEvidence` with `CoverageGap[]` for anything that failed. |
+| `smart.comparePages(urlA, urlB)` | Navigates to both URLs, runs `extractPage()` on each, returns a `ComparisonScaffold` with 11 dimensions, shared/missing fields, and comparable metrics. |
 
 ### Typed Evidence
 
-Methods for structured analysis findings:
+Methods for structured analysis findings with confidence propagation:
 
 | Method | Description |
 |--------|-------------|
-| `smart.finding(data)` | Create a validated `Finding` with confidence scoring |
-| `smart.findings()` | Get all session-accumulated findings |
-| `smart.clearFindings()` | Reset session finding state |
+| `smart.finding(data)` | Create a validated `Finding` with claim, evidence, sourceUrl, confidence, and method. Rejects malformed input with specific errors. |
+| `smart.findings()` | Get all session-accumulated findings (returns a copy) |
+| `smart.clearFindings()` | Reset session findings and coverage gaps |
 
-Findings support confidence propagation — gaps in data collection automatically cap confidence and add `confidenceCapped` / `cappedBy` fields.
+When a finding's `dimension` matches an active coverage gap, confidence is automatically capped:
+
+| Input Confidence | Active Gap | Output |
+|-----------------|------------|--------|
+| `high` | `reducesConfidence: true` | `medium` + `confidenceCapped: true` |
+| `medium` | `reducesConfidence: true` | `low` + `confidenceCapped: true` |
+| `low` | any | `low` (floor) |
+| any | no matching gap | unchanged |
 
 ### Framework Namespaces
 
@@ -307,18 +423,176 @@ When a framework is detected, the smart object exposes framework-specific helper
 
 </details>
 
+## Method Mode
+
+Method Mode is a domain layer built on top of Code Mode. It adds higher-order methods, a typed evidence system, and a behavioral protocol to the `execute` sandbox — without changing the tool surface. The model still sees three tools. The same `smart` object. The same 133-command catalog underneath. What changes is what happens *inside* `execute`.
+
+### The Maturity Ladder
+
+| Layer | Optimizes For | Behavioral Variance | Evidence Quality |
+|-------|---------------|---------------------|-----------------|
+| **Raw MCP** (100 tools) | Completeness | High — flat tool list, no composition guidance | None — unstructured text |
+| **Code Mode** (3 tools) | Token efficiency | Medium — right primitives, ad-hoc composition | None — model-defined shapes |
+| **Method Mode v1** (+ 8 methods + protocol) | Consistency | Low — proper methods, protocol constraints | Convention — `{ finding, evidence, url }` |
+| **Method Mode v2** (+ typed evidence + gaps + confidence) | Correctness | Minimal — typed schemas, tool-enforced findings | Structural — typed records, gap tracking, confidence propagation |
+
+### Architecture
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                      execute sandbox                       │
+│                                                            │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Behavioral Protocol  (web-research skill)           │  │
+│  │  Acquire → Normalize → Analyze                       │  │
+│  ├──────────────────────────────────────────────────────┤  │
+│  │  Evidence Infrastructure                             │  │
+│  │  finding() · findings() · clearFindings()            │  │
+│  │  Typed records · Coverage gaps · Confidence prop.    │  │
+│  ├──────────────────────────────────────────────────────┤  │
+│  │  Higher-Order Methods  [8]                           │  │
+│  │  scrollCapture · waitForIdle · extractPage ·         │  │
+│  │  comparePages · detectTables · extractTable ·        │  │
+│  │  waitForNetworkIdle · extractData                    │  │
+│  ├──────────────────────────────────────────────────────┤  │
+│  │  Smart Core  [7 methods]                             │  │
+│  │  evaluate · click · type · navigate · waitFor ·      │  │
+│  │  snapshot · screenshot                               │  │
+│  ├──────────────────────────────────────────────────────┤  │
+│  │  Framework Namespaces  [up to 17, injected JIT]      │  │
+│  │  react · vue · angular · nextjs · shopify · ...      │  │
+│  ├──────────────────────────────────────────────────────┤  │
+│  │  bridge.send()  — 133 raw commands                   │  │
+│  └──────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────┘
+```
+
+Each layer up encodes more domain knowledge. `bridge.send({ type: "capture_page" })` captures a page. `smart.extractPage()` captures a page AND runs performance metrics, security state, font detection, accessibility analysis, and mobile-readiness checks in parallel — seven operations, one call, graceful failure on supplementary data, typed gaps for anything that fails.
+
+### Evidence Infrastructure
+
+**Coverage Gaps** — When supplementary operations in `extractPage()` fail, they don't silently return `null`. A typed gap is recorded with the dimension, reason, impact, and whether it reduces confidence on related findings:
+
+```javascript
+// Example gap from a failed performance metrics call
+{ dimension: "performance", reason: "CDP domain disabled", impact: "method-failed", reducesConfidence: true }
+```
+
+**Tool-Enforced Findings** — `smart.finding()` validates every field at the tool level. The model cannot produce a finding without meeting the schema — it either returns a valid `Finding` or gets a clear error. Findings accumulate across `execute` calls within a session via `smart.findings()`.
+
+**Session Aggregation** — Findings and coverage gaps persist across `execute` calls. A model can make findings across multiple calls, then retrieve the full set with `smart.findings()`. Reset with `smart.clearFindings()`.
+
+### End-to-End Example: Competitive Audit
+
+```javascript
+// 1. Extract and compare both sites (scaffold + gaps included)
+const comparison = await smart.comparePages(
+  'https://acme.com',
+  'https://rival.com'
+);
+
+// 2. Make findings — confidence auto-adjusts based on data availability
+smart.finding({
+  claim: 'Rival loads 2.3x faster on Largest Contentful Paint',
+  evidence: [
+    `Acme LCP: ${comparison.siteA.performance?.webVitals?.lcp}ms`,
+    `Rival LCP: ${comparison.siteB.performance?.webVitals?.lcp}ms`,
+  ],
+  sourceUrl: 'https://acme.com',
+  confidence: 'high',
+  method: 'comparePages + extractPage performance metrics',
+  dimension: 'performance',  // if perf data failed, confidence caps to "medium"
+});
+
+smart.finding({
+  claim: 'Acme has 12 images without alt text; Rival has 0',
+  evidence: [
+    `Acme imagesWithoutAlt: ${comparison.siteA.accessibility?.imagesWithoutAlt}`,
+    `Rival imagesWithoutAlt: ${comparison.siteB.accessibility?.imagesWithoutAlt}`,
+  ],
+  sourceUrl: 'https://acme.com',
+  confidence: 'high',
+  method: 'comparePages + extractPage accessibility summary',
+  dimension: 'accessibility',
+});
+
+// 3. Capture visual evidence
+await smart.navigate('https://acme.com');
+await smart.waitForIdle();
+const acmeVisuals = await smart.scrollCapture({ maxSections: 5 });
+
+// 4. Return accumulated session findings + visual evidence
+return {
+  findings: smart.findings(),
+  scaffold: comparison.scaffold,
+  gaps: { acme: comparison.siteA.gaps, rival: comparison.siteB.gaps },
+  visualEvidence: { acme: acmeVisuals.sectionCount + ' sections captured' },
+};
+```
+
+## Examples
+
+#### Navigate, extract, and analyze
+
+```javascript
+// Connect to active tab, extract structured page evidence
+const page = await smart.extractPage();
+const finding = smart.finding({
+  claim: `Site uses ${page.capture.framework?.name || 'no detected framework'}`,
+  evidence: [`Framework: ${JSON.stringify(page.capture.framework)}`],
+  sourceUrl: page.meta?.canonical || 'active tab',
+  confidence: 'high',
+  method: 'extractPage framework detection',
+});
+return { page: page.meta, finding };
+```
+
+#### Mobile emulation + screenshot
+
+```javascript
+// Emulate iPhone and capture
+await bridge.send({ type: 'emulate_device', device: 'iPhone 14' }, 10000);
+await smart.navigate('https://example.com');
+await smart.waitForIdle();
+const screenshot = await smart.screenshot();
+return screenshot;
+```
+
+#### Record and compile automation
+
+```javascript
+// Record a browser session, then compile to reusable skill
+await bridge.send({ type: 'start_recording' }, 10000);
+await smart.navigate('https://example.com');
+await smart.click('button.submit');
+await smart.type('#email', 'test@example.com');
+const session = await bridge.send({ type: 'stop_recording' }, 10000);
+return compileRecording(session.session, 'signup-flow');
+```
+
+#### Intercept and mock network
+
+```javascript
+// Block analytics, mock API response
+await bridge.send({
+  type: 'browser_intercept',
+  pattern: '*analytics*',
+  action: 'block'
+}, 10000);
+await bridge.send({
+  type: 'browser_intercept',
+  pattern: '*/api/user',
+  action: 'mock',
+  body: JSON.stringify({ name: 'Test User' }),
+  statusCode: 200
+}, 10000);
+await smart.navigate('https://example.com');
+return await smart.snapshot();
+```
+
 ## Session Recording
 
-Record browser sessions as structured data, then compile them into reusable automation skills.
-
-| Tool | Description |
-|------|-------------|
-| `start_recording` | Begin recording interactions, navigations, network, console |
-| `stop_recording` | Stop and return full session data |
-| `get_recording_status` | Check if recording is active |
-| `compile_recording` | Convert a recorded session into a SKILL.md automation |
-
-12 interaction tools are automatically intercepted during recording (click, type, navigate, scroll, etc.). Each interaction captures args, result, timing, and page URL.
+Record browser sessions as structured data, then compile them into reusable automation skills. 12 interaction tools are automatically intercepted during recording (click, type, navigate, scroll, etc.), capturing args, result, timing, and page URL.
 
 ```javascript
 // In code mode: record, interact, compile
@@ -329,9 +603,11 @@ const skill = compileRecording(session.session, 'my-automation');
 return skill;
 ```
 
+In full mode, recording is available as 4 individual tools: `start_recording`, `stop_recording`, `get_recording_status`, and `compile_recording`.
+
 ## Auto-Settling
 
-Mutative tools (`browser_click`, `browser_type`, `browser_navigate`, `browser_select_option`) use Playwright-inspired actionability checks:
+Mutative tools (`browser_click`, `browser_type`, `browser_navigate`, `browser_select_option`) use actionability checks:
 
 1. **Pre-flight**: Polls element visibility, stability, and enabled state before acting
 2. **Action**: Dispatches the CDP command
@@ -353,6 +629,9 @@ Detects **64 technologies** across 4 tiers using globals, DOM markers, meta tags
 Multi-framework detection returns a **primary** framework (meta-framework takes priority) plus a `subFrameworks` array for the full stack.
 
 ## Tools Reference
+
+<details>
+<summary><b>All 100 tools</b> — Connection, Capture, Navigation, Network, Storage, Emulation, and more</summary>
 
 ### Connection & Status
 
@@ -534,19 +813,23 @@ Multi-framework detection returns a **primary** framework (meta-framework takes 
 | `get_crawled_urls` | Get crawled URLs with status and pagination |
 | `enrich_url` | Navigate + capture + submit enrichment in one call |
 
+</details>
+
 ## Requirements
 
 - **Node.js** >= 18
-- **Chrome** (or Chromium) with the [Crawlio Agent extension](https://crawlio.app/agent) installed
+- **Chrome** (or Chromium) with the [Crawlio Agent extension](https://www.crawlio.app/browser-agent) installed
 - **Crawlio.app** (optional) — for site crawling and enrichment
 
 ## Resources
 
-- [Documentation](https://crawlio.app/agent) — Getting started, extension install, configuration
-- [Architecture Guide](https://docs.crawlio.app/browser-agent/jit-context-runtime) — JIT Context Runtime deep dive
-- [Contributing](CONTRIBUTING.md) — How to contribute to Crawlio Agent
-- [Security](SECURITY.md) — Security model, trust boundaries, vulnerability reporting
-- [Changelog](https://github.com/Crawlio-app/crawlio-browser-agent/releases) — Release notes
+- [Documentation](https://docs.crawlio.app/browser-agent/overview)
+- [API Reference](https://docs.crawlio.app/browser-agent/tools)
+- [Product Page](https://www.crawlio.app/browser-agent)
+- [Chrome Extension](https://www.crawlio.app/browser-agent)
+- [npm Package](https://www.npmjs.com/package/crawlio-browser)
+- [Changelog](https://github.com/Crawlio-app/crawlio-browser-agent/releases)
+- [Previous repo](https://github.com/AshDevFr/crawlio-browser-mcp) — this project supersedes `crawlio-browser-mcp`
 
 ## License
 

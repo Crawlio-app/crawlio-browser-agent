@@ -113,6 +113,7 @@ When comparing sites, evaluate these dimensions:
 8. **Tech Differentiation** — unique technical capabilities, architecture
 9. **UI Quality** — design polish, loading speed, mobile responsiveness
 10. **Conversion Friction** — signup flow, CTAs, form length, friction points
+11. **Data Structure** — structured data presence, table extraction, schema.org
 
 ## Anti-Patterns
 

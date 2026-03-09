@@ -133,3 +133,43 @@ export interface MethodTrace {
   steps: StepTrace[];
   outcome: "success" | "partial" | "timeout" | "error";
 }
+
+// --- Phase 11: Structured Data Extraction ---
+
+export interface TableCandidate {
+  selector: string;
+  score: number;
+  rowCount: number;
+  sampleText: string;       // first 200 chars of children text
+  area: number;              // visual area of container
+}
+
+export interface TableColumn {
+  name: string;              // smart-named (from IDS column naming algo)
+  path: string;              // XPath-like key from recursive extraction
+  fillRate: number;          // 0-1, fraction of rows that have this column
+}
+
+export interface ExtractedRow {
+  [column: string]: string;  // column name → cell value
+}
+
+export interface TableExtraction {
+  selector: string;
+  columns: TableColumn[];
+  rows: ExtractedRow[];
+  totalRows: number;
+  truncated: boolean;        // true if rows were capped
+}
+
+export interface NetworkIdleResult {
+  status: "idle" | "timeout";
+  elapsed: number;           // ms waited
+  pendingAtTimeout?: number; // requests still pending if timeout
+}
+
+export interface DataExtraction {
+  tables: TableExtraction[];
+  structuredData: unknown[];  // JSON-LD (already extracted by extractPage meta)
+  url: string;
+}

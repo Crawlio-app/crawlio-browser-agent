@@ -4,6 +4,15 @@ All notable changes to the Browser Agent are documented here.
 
 > For the full release history, see the [`releases/`](./releases/) directory.
 
+## [1.6.0] - 2026-03-11
+
+### Fixed
+
+- CWS extension bridge connection — added Chrome Private Network Access headers to health endpoint
+- Persistent reconnect alarm ensures extension always retries server discovery
+
+[Full release notes](./releases/v1.6.0.md)
+
 ## [1.5.9] - 2026-03-11
 
 ### Security Hardening

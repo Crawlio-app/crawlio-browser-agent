@@ -4,6 +4,19 @@ All notable changes to the Browser Agent are documented here.
 
 > For the full release history, see the [`releases/`](./releases/) directory.
 
+## [1.6.1] - 2026-03-13
+
+### New Features
+
+- 114 tools (was 100) — detection wedge, SEO intelligence, technographic fingerprinting
+- 147 searchable commands in code mode (was 133), 17 smart.* methods (was 8)
+
+### Fixes
+
+- parseInt masking, info disclosure truncation, regex corrections, Levenshtein DoS cap
+
+[Full release notes](./releases/v1.6.1.md)
+
 ## [1.6.0] - 2026-03-11
 
 ### Fixed

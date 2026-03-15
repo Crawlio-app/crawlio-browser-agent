@@ -1,7 +1,7 @@
 /// <reference path="../env.d.ts" />
 // Runtime icon generation via OffscreenCanvas with colored state indicator dots
 
-export type IconState = "default" | "active" | "framework" | "warning" | "error";
+export type IconState = "default" | "active" | "framework" | "warning" | "error" | "serp";
 
 export const STATE_COLORS: Record<IconState, string | null> = {
   default: null,        // no overlay
@@ -9,6 +9,7 @@ export const STATE_COLORS: Record<IconState, string | null> = {
   framework: "#3b82f6", // blue-500
   warning: "#f59e0b",   // amber-500
   error: "#ef4444",     // red-500
+  serp: "#f97316",      // orange-500 — Google SERP detected
 };
 
 const baseIconCache = new Map<number, ImageBitmap>();
@@ -72,4 +73,40 @@ export function resetIcon(tabId?: number): void {
   };
   if (tabId !== undefined) details.tabId = tabId;
   chrome.action.setIcon(details).catch(() => {});
+}
+
+// --- Badge text system ---
+
+const BADGE_DEFAULT_COLOR = "#3b82f6"; // blue-500
+const BADGE_TEXT_COLOR = "#ffffff";
+
+/** Set badge text and background color on the extension icon for a specific tab */
+export async function setBadgeInfo(tabId: number, text: string, color?: string): Promise<void> {
+  try {
+    await Promise.all([
+      chrome.action.setBadgeText({ tabId, text }),
+      chrome.action.setBadgeBackgroundColor({ tabId, color: color ?? BADGE_DEFAULT_COLOR }),
+      chrome.action.setBadgeTextColor({ tabId, color: BADGE_TEXT_COLOR }),
+    ]);
+  } catch {
+    // Tab may be gone or badge API unavailable
+  }
+}
+
+/** Clear badge text for a specific tab */
+export async function clearBadge(tabId: number): Promise<void> {
+  try {
+    await chrome.action.setBadgeText({ tabId, text: "" });
+  } catch {
+    // Tab may be gone
+  }
+}
+
+/** Set the tooltip (title) text for the extension icon on a specific tab */
+export async function setTooltip(tabId: number, text: string): Promise<void> {
+  try {
+    await chrome.action.setTitle({ tabId, title: text });
+  } catch {
+    // Tab may be gone
+  }
 }

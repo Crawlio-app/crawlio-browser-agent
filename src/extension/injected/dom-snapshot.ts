@@ -8,11 +8,16 @@ export function captureDOMSnapshot(maxDepth: number): any {
   const MAX_TEXT = 200;
   const MAX_ATTR = 500;
   const MAX_SNAPSHOT = 5 * 1024 * 1024; // 5MB
+  const MAX_NODES = 50_000;
+  let nodeCount = 0;
+  let nodeLimitReached = false;
   let shadowRootCount = 0;
   let maxDepthReached = 0;
 
   function walk(node: Element, depth: number): any {
     if (depth > maxDepth) return null;
+    if (nodeCount >= MAX_NODES) { nodeLimitReached = true; return null; }
+    nodeCount++;
     if (depth > maxDepthReached) maxDepthReached = depth;
     const tag = node.tagName?.toLowerCase();
     if (!tag || SKIP_TAGS.has(node.tagName)) return null;
@@ -126,10 +131,11 @@ export function captureDOMSnapshot(maxDepth: number): any {
 
   const metadata = {
     sizeBytes: html.length,
-    truncated,
+    truncated: truncated || nodeLimitReached,
     shadowRoots: shadowRootCount,
     iframeCount: iframes.length,
     depth: maxDepthReached,
+    ...(nodeLimitReached ? { _truncated: true, nodeCount, maxNodes: MAX_NODES } : {}),
   };
 
   return { tree, html, iframes, metadata };

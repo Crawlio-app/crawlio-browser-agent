@@ -1,6 +1,6 @@
 ---
 name: browser-automation
-description: Use this skill when the user asks to interact with a browser, take screenshots, inspect a page, capture network traffic, detect frameworks, click elements, fill forms, record browser sessions, or automate any browser task. Orchestrates crawlio-agent's 100 browser tools via the search + execute + connect_tab interface.
+description: Use this skill when the user asks to interact with a browser, take screenshots, inspect a page, capture network traffic, detect frameworks, click elements, fill forms, record browser sessions, or automate any browser task. Orchestrates crawlio-agent's 114 browser tools via the search + execute + connect_tab interface.
 allowed-tools: mcp__crawlio-browser__search, mcp__crawlio-browser__execute, mcp__crawlio-browser__connect_tab
 ---
 
@@ -44,6 +44,28 @@ return await bridge.send({ type: "get_connection_status" })
 4. **`connect_tab` before any interaction** — most commands require an active tab connection.
 5. **`smart.evaluate` returns `{ result, type }`** — NOT the raw value. Access `.result` to get the value. Never `JSON.parse()` the return directly.
 6. **Keep scripts fast** — each `execute` call should complete in <15s. Split loops over many elements into separate `execute` calls. Never loop 5+ `smart.click` calls in one script.
+
+## Evidence Protocol
+
+For research tasks (page analysis, comparison, auditing), follow **Acquire → Normalize → Analyze**:
+
+1. **Acquire** — use `smart.extractPage()` for structured evidence (7 parallel ops: capture + perf + security + fonts + meta + accessibility + mobile-readiness, with typed gaps). Use `smart.scrollCapture()` for visual evidence. Use `smart.waitForIdle()` instead of `sleep()`.
+2. **Normalize** — `extractPage` returns `{ capture, performance, security, fonts, meta, accessibility, mobileReadiness, gaps }`. Check `gaps[]` before trusting supplementary data — failed calls produce `null` + a gap record.
+3. **Analyze** — use `smart.finding({ claim, evidence, sourceUrl, confidence, method, dimension? })` to create validated findings. Confidence auto-caps when dimension has active gap with `reducesConfidence`.
+
+For comparisons, use `smart.comparePages(urlA, urlB)` — returns `{ siteA, siteB, scaffold }` with 11 fixed comparison dimensions.
+
+Retrieve all findings with `smart.findings()`. Reset with `smart.clearFindings()`.
+
+## Anti-Patterns
+
+1. **No `smart.screenshot()`** — it does not exist. Use `bridge.send({ type: 'take_screenshot' })` or `smart.scrollCapture()` for multi-section visual evidence.
+2. **No blind `sleep()` loops** — use `smart.waitForIdle()` (MutationObserver-based, 15s cap) or `smart.waitFor(selector)`.
+3. **No manual scroll+screenshot loops** — use `smart.scrollCapture({ maxSections: 10 })`. It handles bottom detection, stuck scroll, and scroll reset.
+4. **No raw `capture_page` + `detect_framework` combo** — `smart.extractPage()` does both plus 5 more operations in one call with graceful failure.
+5. **`capture_page` returns ~1KB shaped summary** — counts and top errors, not raw arrays. For raw network data use `stop_network_capture`. For raw console logs use `get_console_logs`.
+6. **No `smart.snapshot({ compact: true })`** — the `compact` option does not exist. Use `smart.snapshot()` with no options, or `{ interactive: true }` for clickable elements only.
+7. **No `location.href = "..."` for navigation** — use `smart.navigate(url)`. Direct location assignment breaks CDP debugger attachment.
 
 ## Core Patterns via `execute`
 
@@ -308,7 +330,7 @@ When you don't know the exact command, search first:
 search({ query: "cookies" })
 ```
 
-This returns matching command names, descriptions, and parameter schemas from the full catalog of 133 commands (100 browser + 33 desktop).
+This returns matching command names, descriptions, and parameter schemas from the full catalog of 147 commands (114 browser + 33 desktop).
 
 ## Desktop Integration (Crawlio App)
 
@@ -450,23 +472,53 @@ const title = (await smart.evaluate("document.title")).result
 return { title, url: (await smart.evaluate("location.href")).result }
 ```
 
-## Higher-Order Methods
+## Higher-Order Methods (17)
 
-These methods compose existing bridge commands into common workflows:
+These methods compose existing bridge commands into common workflows. The `smart` object exposes 7 core methods + 17 higher-order methods + up to 17 framework namespaces.
+
+### Evidence Extraction
 
 ```js
-// Scroll through page with screenshots — stops at page bottom, returns sections with scroll positions
+// Full page extraction — 7 parallel ops: capture + perf + security + fonts + meta + a11y + mobile
+// Returns PageEvidence with gaps[] tracking what failed
+const page = await smart.extractPage()
+
+// Compare two pages — navigates to each, runs extractPage(), returns ComparisonEvidence + scaffold
+const diff = await smart.comparePages("https://a.com", "https://b.com")
+
+// Scroll through page with screenshots — stops at page bottom, handles stuck scroll
 const result = await smart.scrollCapture({ maxSections: 10, pixelsPerScroll: 800, settleMs: 1000 })
 
 // Wait for DOM to settle (500ms quiet window) — use instead of sleep()
 const idle = await smart.waitForIdle(5000)  // returns { status: 'idle' | 'timeout' }
 
-// Full page extraction — capture_page + perf + security + fonts + meta/headings/structured data
-const page = await smart.extractPage()
+// Diff accessibility snapshots before/after an interaction
+const diff = await smart.diffSnapshots(beforeSnapshot)
+```
 
-// Compare two pages — navigates to each, runs extractPage(), returns structured pair
-const diff = await smart.comparePages("https://a.com", "https://b.com")
+### Findings (Evidence Mode)
 
+```js
+// Create a validated finding — confidence auto-caps if dimension has active gap
+smart.finding({
+  claim: "Site loads 2x faster",
+  evidence: ["LCP: 1200ms vs 2400ms"],
+  sourceUrl: "https://example.com",
+  confidence: "high",
+  method: "extractPage",
+  dimension: "performance"  // optional — triggers confidence propagation
+})
+
+// Get all accumulated findings from this session
+const allFindings = smart.findings()
+
+// Reset session findings and gaps
+smart.clearFindings()
+```
+
+### Data Extraction
+
+```js
 // Detect table-like structures in the DOM — returns scored candidates
 const tables = await smart.detectTables()
 
@@ -480,8 +532,27 @@ const idle = await smart.waitForNetworkIdle(5000)
 const extracted = await smart.extractData()
 ```
 
+### Tracking & Technology Detection
+
+```js
+// Parse tracking pixels from captured network requests (GA, FB, etc.)
+const pixels = await smart.parseTrackingPixels()
+
+// Schema-validate tracking parameters, detect typos
+const issues = await smart.validateTracking()
+
+// Read runtime tracker state (GTM dataLayer, etc.)
+const dataLayer = await smart.inspectDataLayer()
+
+// Find duplicate tracking events
+const dupes = await smart.detectDuplicates()
+
+// Wappalyzer-style fingerprint-based technology detection
+const tech = await smart.detectTechnologies()
+```
+
 For multi-page research protocols (competitive analysis, site audits), see the **web-research** skill.
 
 ## Reference
 
-See [reference.md](./reference.md) for the full list of all 100 browser commands and 33 desktop commands with parameters.
+See [reference.md](./reference.md) for the full list of all 114 browser commands and 33 desktop commands with parameters.

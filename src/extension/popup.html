@@ -25,7 +25,11 @@
         <button id="enable-btn" class="btn btn-enable">Enable Crawlio</button>
       </div>
 
-      <button id="connect-btn" class="btn btn-connect" style="display:none">Connect</button>
+      <div id="waiting-card" class="waiting-card" style="display:none">
+        <span class="waiting-dot"></span>
+        <span class="waiting-text">Waiting for MCP server...</span>
+      </div>
+      <button id="reconnect-btn" class="reconnect-link" style="display:none">Reconnect</button>
       <button id="disconnect-btn" class="btn btn-disconnect" style="display:none">Disconnect</button>
       <button id="setup-btn" class="setup-link" style="display:none">Complete setup</button>
     </div>

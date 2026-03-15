@@ -7,7 +7,7 @@ export default defineConfig({
     include: ["tests/**/*.test.ts"],
     coverage: {
       provider: "v8",
-      include: ["src/shared/**", "src/extension/sensors/**", "src/extension/enrichment-store.ts"],
+      include: ["src/shared/**", "src/extension/sensors/**", "src/extension/enrichment-store.ts", "src/mcp-server/**"],
       thresholds: {
         lines: 60,
       },

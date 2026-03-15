@@ -238,8 +238,9 @@ The `smart` object provides auto-waiting wrappers and framework-specific data:
 | `smart.navigate(url, opts?)` | Navigate + 1000ms settle |
 | `smart.waitFor(selector, timeout?)` | Poll until element is actionable |
 | `smart.snapshot()` | Capture accessibility snapshot |
-| `smart.screenshot()` | Take screenshot (returns base64 PNG) |
-| `smart.rebuild()` | Force rebuild of framework namespaces |
+| `smart.rebuild()` | Refresh framework detection cache (forces re-probe on next call) |
+
+> **Note:** There is no `smart.screenshot()` method. For screenshots, use `bridge.send({ type: 'take_screenshot' })` or `smart.scrollCapture()` for multi-section visual evidence.
 
 ### Framework Namespaces
 

@@ -21,7 +21,7 @@ function createMockBridge(responses: Array<{ data?: unknown; error?: string }>) 
 }
 
 describe("ACTIONABILITY_BACKOFF", () => {
-  it("matches Playwright's progressive backoff schedule", () => {
+  it("matches the progressive backoff schedule", () => {
     expect(ACTIONABILITY_BACKOFF).toEqual([0, 20, 100, 100, 500]);
   });
 

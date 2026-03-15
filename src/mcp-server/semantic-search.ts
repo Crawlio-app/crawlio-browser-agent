@@ -1,10 +1,9 @@
 /**
  * Semantic search for tool discovery.
  *
- * Architecture mirrors PiecesOS runtime_vector_search:
- * - search_simd.rs → pure TS cosine similarity (adequate at 95-tool scale)
- * - archive_vectors table → tool-embeddings.json (pre-computed at build time)
- * - SIMD acceleration unnecessary — 95 * 512-dim < 50KB, sub-ms search
+ * - Pure TS cosine similarity (adequate at 100-tool scale)
+ * - tool-embeddings.json (pre-computed at build time)
+ * - 100 * 512-dim < 50KB, sub-ms search
  */
 
 import { readFileSync } from "fs";
@@ -13,7 +12,7 @@ import { fileURLToPath } from "url";
 
 // --- Types ---
 
-export interface EmbeddingAsset {
+interface EmbeddingAsset {
   model: string;
   dimension: number;
   generated: string;

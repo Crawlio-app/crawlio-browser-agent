@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "child_process";
-import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, copyFileSync, chmodSync, symlinkSync, unlinkSync } from "fs";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, copyFileSync, chmodSync, symlinkSync, unlinkSync, renameSync } from "fs";
 import { join, resolve, dirname, sep, basename } from "path";
 import { homedir, platform } from "os";
 import { createServer as createNetServer } from "net";
@@ -30,6 +30,27 @@ const LOGO_GRADIENT = [
   "\x1b[38;5;62m",   // medium blue
   "\x1b[38;5;56m",   // deep blue
 ];
+
+// --- Helpers: safe file writing & escaping ---
+
+function atomicWriteSync(filePath: string, data: string): void {
+  const tmpPath = filePath + ".tmp";
+  writeFileSync(tmpPath, data);
+  renameSync(tmpPath, filePath);
+}
+
+export function escapeToml(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+export function escapeYaml(value: string): string {
+  if (/[:#\[\]{*&]/.test(value)) return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  return value;
+}
+
+function escapeShellSingleQuote(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
 
 // --- Types ---
 
@@ -216,8 +237,9 @@ export function configureClient(
     if (existsSync(client.configPath)) {
       try {
         config = JSON.parse(readFileSync(client.configPath, "utf-8")) as Record<string, unknown>;
-      } catch {
-        config = {};
+      } catch (err) {
+        console.log(`    ${yellow("!")} Corrupt JSON in ${client.configPath}: ${err instanceof Error ? err.message : String(err)}`);
+        return "error";
       }
     }
     const section = (config[client.serverKey] || {}) as Record<string, unknown>;
@@ -227,8 +249,13 @@ export function configureClient(
 
     section["crawlio-browser"] = finalEntry;
     config[client.serverKey] = section;
-    mkdirSync(dirname(client.configPath), { recursive: true });
-    writeFileSync(client.configPath, JSON.stringify(config, null, 2) + "\n");
+    try {
+      mkdirSync(dirname(client.configPath), { recursive: true });
+      atomicWriteSync(client.configPath, JSON.stringify(config, null, 2) + "\n");
+    } catch (err) {
+      console.log(`    ${yellow("!")} Failed to write ${client.configPath}: ${err instanceof Error ? err.message : String(err)}`);
+      return "error";
+    }
     return "configured";
   }
 
@@ -244,10 +271,15 @@ export function configureClient(
     if (dryRun) return "configured";
 
     const e = entry as { command: string; args?: string[] };
-    const argsStr = (e.args || []).map((a: string) => `"${a}"`).join(", ");
-    const block = `\n[mcp_servers.crawlio-browser]\ncommand = "${e.command}"\nargs = [${argsStr}]\n`;
-    mkdirSync(dirname(client.configPath), { recursive: true });
-    writeFileSync(client.configPath, content + block);
+    const argsStr = (e.args || []).map((a: string) => `"${escapeToml(a)}"`).join(", ");
+    const block = `\n[mcp_servers.crawlio-browser]\ncommand = "${escapeToml(e.command)}"\nargs = [${argsStr}]\n`;
+    try {
+      mkdirSync(dirname(client.configPath), { recursive: true });
+      atomicWriteSync(client.configPath, content + block);
+    } catch (err) {
+      console.log(`    ${yellow("!")} Failed to write ${client.configPath}: ${err instanceof Error ? err.message : String(err)}`);
+      return "error";
+    }
     return "configured";
   }
 
@@ -263,14 +295,19 @@ export function configureClient(
     if (dryRun) return "configured";
 
     const e = entry as { command: string; args?: string[] };
-    const argsYaml = (e.args || []).map((a: string) => `      - ${a}`).join("\n");
-    const block = `\n  crawlio-browser:\n    name: crawlio-browser\n    type: stdio\n    cmd: ${e.command}\n    args:\n${argsYaml}\n`;
+    const argsYaml = (e.args || []).map((a: string) => `      - ${escapeYaml(a)}`).join("\n");
+    const block = `\n  crawlio-browser:\n    name: crawlio-browser\n    type: stdio\n    cmd: ${escapeYaml(e.command)}\n    args:\n${argsYaml}\n`;
     // Ensure extensions: section exists
     if (!content.includes("extensions:")) {
       content += "\nextensions:\n";
     }
-    mkdirSync(dirname(client.configPath), { recursive: true });
-    writeFileSync(client.configPath, content + block);
+    try {
+      mkdirSync(dirname(client.configPath), { recursive: true });
+      atomicWriteSync(client.configPath, content + block);
+    } catch (err) {
+      console.log(`    ${yellow("!")} Failed to write ${client.configPath}: ${err instanceof Error ? err.message : String(err)}`);
+      return "error";
+    }
     return "configured";
   }
 
@@ -280,7 +317,7 @@ export function configureClient(
 export function configureAllClients(options: InitOptions): void {
   const entry = options.portal
     ? (buildPortalEntry() as unknown as Record<string, unknown>)
-    : (buildStdioEntry({ full: options.full }) as unknown as Record<string, unknown>);
+    : (buildStdioEntry({ full: options.full, dryRun: options.dryRun }) as unknown as Record<string, unknown>);
 
   // Filter by -a flag or auto-detect
   const candidates = options.agents.length > 0
@@ -326,9 +363,9 @@ function printManualInstructions(entry: Record<string, unknown>): void {
   console.log("");
 }
 
-export function buildStdioEntry(options?: { full?: boolean }): { command: string; args: string[] } {
+export function buildStdioEntry(options?: { full?: boolean; dryRun?: boolean }): { command: string; args: string[] } {
   // On macOS, try to create an .app wrapper for Activity Monitor branding
-  if (platform() === "darwin") {
+  if (platform() === "darwin" && !options?.dryRun) {
     const serverPath = getServerEntryPath();
     const wrapperPath = createAppWrapper(serverPath);
     if (wrapperPath) {
@@ -549,7 +586,7 @@ export function createAppWrapper(serverEntryPath: string): string | null {
 
   // Shell launcher script that exec's node with the server entry
   const nodePath = resolveNodePath();
-  const script = `#!/bin/bash\nexec "${nodePath}" "${serverEntryPath}" "$@"\n`;
+  const script = `#!/bin/bash\nexec ${escapeShellSingleQuote(nodePath)} ${escapeShellSingleQuote(serverEntryPath)} "$@"\n`;
 
   try {
     writeFileSync(wrapperBin, script);
@@ -709,6 +746,13 @@ interface SkillDef {
 const BUNDLED_SKILLS: SkillDef[] = [
   { name: "browser-automation", files: ["SKILL.md", "reference.md"] },
   { name: "web-research", files: ["SKILL.md"] },
+  { name: "investigate", files: ["SKILL.md"] },
+  { name: "extract", files: ["SKILL.md"] },
+  { name: "compare", files: ["SKILL.md"] },
+  { name: "clone", files: ["SKILL.md"] },
+  { name: "dossier", files: ["SKILL.md"] },
+  { name: "monitor", files: ["SKILL.md"] },
+  { name: "test", files: ["SKILL.md"] },
 ];
 
 export function installBrowserSkill(dryRun: boolean): void {
@@ -1005,13 +1049,13 @@ async function cloudflareFlow(options: InitOptions): Promise<void> {
       delete mcpConfig.config.mcpServers["cloudflare-builds"];
     }
     mcpConfig.config.mcpServers["cloudflare"] = entry as unknown as Record<string, unknown>;
-    writeFileSync(mcpConfig.path, JSON.stringify(mcpConfig.config, null, 2) + "\n");
+    atomicWriteSync(mcpConfig.path, JSON.stringify(mcpConfig.config, null, 2) + "\n");
     console.log(`    ${green("+")} Added cloudflare to ${mcpConfig.path}`);
   } else {
     // No .mcp.json found — create one
     const configPath = join(process.cwd(), ".mcp.json");
     const config = { mcpServers: { cloudflare: entry } };
-    writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+    atomicWriteSync(configPath, JSON.stringify(config, null, 2) + "\n");
     console.log(`    ${green("+")} Created ${configPath} with cloudflare`);
   }
 
@@ -1056,7 +1100,7 @@ async function configureMetaMcp(found: McpConfigResult, options: InitOptions): P
     }
   }
 
-  const entry = options.portal ? buildPortalEntry() : buildStdioEntry({ full: options.full });
+  const entry = options.portal ? buildPortalEntry() : buildStdioEntry({ full: options.full, dryRun: options.dryRun });
 
   if (options.dryRun) {
     console.log(`    ${dim("~")} Would add to ${found.path}:`);
@@ -1065,7 +1109,7 @@ async function configureMetaMcp(found: McpConfigResult, options: InitOptions): P
   }
 
   found.config.mcpServers["crawlio-browser"] = entry;
-  writeFileSync(found.path, JSON.stringify(found.config, null, 2) + "\n");
+  atomicWriteSync(found.path, JSON.stringify(found.config, null, 2) + "\n");
   console.log(`    ${green("+")} Added crawlio-browser to ${found.path}`);
 }
 
@@ -1154,7 +1198,7 @@ async function printSummary(options: InitOptions): Promise<void> {
     }
   } else {
     const modeLabel = options.full ? "Full mode" : "Code mode";
-    const countLabel = options.full ? "(100 tools)" : "(3 tools, 133 commands)";
+    const countLabel = options.full ? "(114 tools)" : "(3 tools, 147 commands)";
     statusLines.push(`${green("+")} Mode        ${modeLabel} ${countLabel}`);
   }
 

@@ -5,14 +5,20 @@ import type { CookieEntry, FrameworkDetection } from "../shared/types";
 import { DEVICE_PROFILES } from "../shared/device-profiles";
 import { buildEvalParams as buildEvalParamsPure } from "../shared/frame-context";
 import { putCapture, getCapture, putNetworkEntries, getNetworkEntries, putConsoleLogs, getConsoleLogs, clearAll } from "./capture-store";
-import { resetIcon, setDynamicIcon } from "./icon-generator";
+import { resetIcon, setDynamicIcon, setBadgeInfo, clearBadge, setTooltip } from "./icon-generator";
+import { isGoogleSerp, extractSearchQuery } from "./serp-detector";
+import { setupContextMenus, handleContextMenuClick } from "./context-menus";
 import type { NetworkEntryInternal } from "./sensors/network-sensor";
 // Runtime extension — _startTime is deleted on loadingFinished/Failed, _seq is a monotonic counter
 type NetworkMapEntry = Omit<NetworkEntryInternal, '_startTime'> & { _startTime?: number; _seq?: number };
 import { STEALTH_SCRIPT } from "./injected/stealth";
 import { FRAMEWORK_HOOK_SCRIPT } from "./injected/framework-hooks";
 import { detectFrameworkInPage } from "./injected/framework-detector";
+import { inspectDataLayer } from "./injected/datalayer-inspector";
 import { captureDOMSnapshot } from "./injected/dom-snapshot";
+import { TRACKER_VENDORS, TRACKING_HEURISTIC_PATTERNS } from "../shared/tracking-vendors";
+import { injectSerpOverlay, removeSerpOverlay } from "./injected/serp-overlay";
+import { SERP_OVERLAY_CSS } from "./injected/serp-overlay-styles";
 
 if (__DEV__) console.log("[Crawlio] v3 — browser capture via MCP loaded");
 
@@ -111,6 +117,22 @@ chrome.runtime.onConnect.addListener((port) => {
 async function persistState() {
   await accumulator.ensureQuota();
   const domainState = debuggerAttachedTabId !== null ? tabDomainState.get(debuggerAttachedTabId) ?? null : null;
+  // Persist recording state (minus non-serializable fields: timeoutHandle, networkSnapshotKeys Set)
+  const recordingState = activeRecording ? {
+    sessionId: activeRecording.sessionId,
+    startedAt: activeRecording.startedAt,
+    _startedAtMs: activeRecording._startedAtMs,
+    tabId: activeRecording.tabId,
+    initialUrl: activeRecording.initialUrl,
+    initialFramework: activeRecording.initialFramework,
+    maxDurationSec: activeRecording.maxDurationSec,
+    maxInteractions: activeRecording.maxInteractions,
+    pages: activeRecording.pages,
+    currentPageUrl: activeRecording.currentPageUrl,
+    totalInteractions: activeRecording.totalInteractions,
+    networkSnapshotKeys: Array.from(activeRecording.networkSnapshotKeys),
+    consoleSnapshotIndex: activeRecording.consoleSnapshotIndex,
+  } : null;
   await chrome.storage.session.set({
     "crawlio:sw-state": {
       debuggerAttachedTabId,
@@ -118,6 +140,7 @@ async function persistState() {
       networkCapturing,
       domainState,
       wasEverConnected,
+      recordingState,
       timestamp: Date.now(),
     },
   });
@@ -166,6 +189,42 @@ async function restoreState() {
     // Had capturing state but no debugger — clear stale UI
     await chrome.storage.session.remove("crawlio:connectedTab");
     writeStatus({ capturing: false, activeTabId: null });
+  }
+
+  // Restore active recording if one was in progress
+  if (state.recordingState) {
+    const rs = state.recordingState;
+    const startedAt = typeof rs._startedAtMs === 'number' ? rs._startedAtMs : 0;
+    const elapsedMs = Date.now() - startedAt;
+    const remainingMs = (rs.maxDurationSec * 1000) - elapsedMs;
+
+    if (remainingMs <= 0) {
+      // Recording already exceeded max duration — auto-stop immediately
+      // Reconstruct just enough state for stopRecordingInternal to finalize
+      activeRecording = {
+        ...rs,
+        timeoutHandle: setTimeout(() => {}, 0), // dummy, cleared immediately
+        networkSnapshotKeys: new Set(rs.networkSnapshotKeys || []),
+      };
+      autoStopRecording("max_duration");
+    } else if (debuggerAttachedTabId === rs.tabId) {
+      // Tab re-attached successfully — restore recording with new timeout
+      activeRecording = {
+        ...rs,
+        timeoutHandle: setTimeout(() => autoStopRecording("max_duration"), remainingMs),
+        networkSnapshotKeys: new Set(rs.networkSnapshotKeys || []),
+      };
+      showRecordingIndicator(rs.tabId);
+      if (__DEV__) console.log(`[Crawlio] SW recovery: restored recording ${rs.sessionId}, ${Math.round(remainingMs / 1000)}s remaining`);
+    } else {
+      // Tab gone or re-attach failed — auto-stop as disconnected
+      activeRecording = {
+        ...rs,
+        timeoutHandle: setTimeout(() => {}, 0),
+        networkSnapshotKeys: new Set(rs.networkSnapshotKeys || []),
+      };
+      autoStopRecording("tab_disconnected");
+    }
   }
 
   if (accumulator.count() > 0) {
@@ -262,29 +321,44 @@ async function sendCDPCommand<T>(
         throw Object.assign(new Error(`CDP ${method} failed: detached mid-flight`), { cdpError: classified, original: error });
       }
 
-      // Case 2: Disconnected + tabId — re-attach once
+      // Case 2: Disconnected + tabId — re-attach with backoff
       if (classified === CDPError.Disconnected && target.tabId && !_isRecovery) {
-        try {
-          await chrome.debugger.detach(target).catch(() => {});
-          await chrome.debugger.attach(target, "1.3");
-          const prevDomains = tabDomainState.get(target.tabId!);
-          if (prevDomains) {
-            for (const d of [...prevDomains.required, ...prevDomains.optional].filter(d => d.success)) {
-              await sendCDPCommand(target, `${d.domain}.enable`, {}, 0, 3000).catch(() => {});
+        const RECOVERY_TIMEOUTS = [1000, 3000, 5000];
+        let recovered = false;
+        for (const rTimeout of RECOVERY_TIMEOUTS) {
+          try {
+            await chrome.debugger.detach(target).catch(() => {});
+            await chrome.debugger.attach(target, "1.3");
+            // Guard against onDetach race clearing tabDomainState
+            const prevDomains = tabDomainState.get(target.tabId!);
+            if (prevDomains) {
+              for (const d of [...prevDomains.required, ...prevDomains.optional].filter(d => d.success)) {
+                await sendCDPCommand(target, `${d.domain}.enable`, {}, 0, rTimeout).catch(() => {});
+              }
+            } else {
+              // Fallback: always re-enable core domains even if state was cleared
+              await sendCDPCommand(target, "Page.enable", {}, 0, rTimeout);
+              await sendCDPCommand(target, "Runtime.enable", {}, 0, rTimeout);
             }
-          } else {
-            await sendCDPCommand(target, "Page.enable", {}, 0, 5000);
-            await sendCDPCommand(target, "Runtime.enable", {}, 0, 5000);
+            recovered = true;
+            break;
+          } catch {
+            // Wait before next recovery attempt — page may still be loading
+            await new Promise(r => setTimeout(r, rTimeout));
           }
-          return await sendCDPCommand<T>(target, method, params, 0, timeoutMs, true);
-        } catch {
-          throw Object.assign(new Error(`CDP ${method} failed: recovery failed`), { cdpError: classified, original: error });
         }
+        if (recovered) {
+          return await sendCDPCommand<T>(target, method, params, 0, timeoutMs, true);
+        }
+        throw Object.assign(new Error(`CDP ${method} failed: recovery failed after ${RECOVERY_TIMEOUTS.length} attempts`), { cdpError: classified, original: error });
       }
 
-      // Case 3: "Another debugger already attached" — swallow
+      // Case 3: "Another debugger already attached" — throw so callers know
       if (classified === CDPError.InvalidParam && /already attached/i.test(msg)) {
-        return {} as T;
+        throw Object.assign(
+          new Error("Another debugger is already attached to this tab. Close DevTools and retry."),
+          { cdpError: classified, original: error }
+        );
       }
 
       // Case 4: Normal retry with backoff
@@ -511,12 +585,13 @@ let networkEntries: Map<string, NetworkMapEntry> = new Map();
 // CV-5: Per-tab ARIA snapshot ref cache (ref string → backendDOMNodeId)
 // backendDOMNodeId is per-renderer-process.
 // Sending Tab A's ID to Tab B's CDP session misses or resolves wrong node.
-const tabAriaState = new Map<number, { refMap: Map<string, number>; counter: number }>();
+// backendDOMNodeId === -1 means cursor-interactive element — resolve via refSelectorMap CSS selector
+const tabAriaState = new Map<number, { refMap: Map<string, number>; refSelectorMap: Map<string, string>; counter: number; lastSnapshot?: string }>();
 
 function getAriaState(tabId: number) {
   let state = tabAriaState.get(tabId);
   if (!state) {
-    state = { refMap: new Map(), counter: 0 };
+    state = { refMap: new Map(), refSelectorMap: new Map(), counter: 0 };
     tabAriaState.set(tabId, state);
   }
   return state;
@@ -563,6 +638,7 @@ const RECORDING_MAX_INTERACTIONS = 500;
 interface ActiveRecording {
   sessionId: string;
   startedAt: string;
+  _startedAtMs: number; // Date.now() at start — for SW restart timeout reconstruction
   tabId: number;
   initialUrl: string;
   initialFramework?: FrameworkDetection;
@@ -595,6 +671,7 @@ interface ActiveRecording {
 
 let activeRecording: ActiveRecording | null = null;
 let lastAutoStoppedSession: any = null;
+let lastAutoStoppedTimer: ReturnType<typeof setTimeout> | null = null;
 
 function finalizeCurrentRecordingPage(): void {
   if (!activeRecording || activeRecording.pages.length === 0) return;
@@ -650,7 +727,12 @@ function stopRecordingInternal(reason: "manual" | "max_duration" | "max_interact
 function autoStopRecording(reason: "max_duration" | "max_interactions" | "tab_closed" | "tab_disconnected"): void {
   const session = stopRecordingInternal(reason);
   if (session) {
+    if (lastAutoStoppedTimer) clearTimeout(lastAutoStoppedTimer);
     lastAutoStoppedSession = session;
+    lastAutoStoppedTimer = setTimeout(() => {
+      lastAutoStoppedSession = null;
+      lastAutoStoppedTimer = null;
+    }, 5 * 60 * 1000);
     removeRecordingIndicator(session.metadata.tabId);
     if (__DEV__) console.log(`[Crawlio] Recording auto-stopped: ${reason}, session ${session.id}`);
   }
@@ -801,6 +883,15 @@ let dialogAutoMode: "accept" | "dismiss" | "queue" = "queue";
 let dialogAutoTimeout: ReturnType<typeof setTimeout> | null = null;
 let dialogSequenceId = 0; // monotonic ID to prevent stale timeout races
 
+// --- SEO Intelligence Settings (Phase 6) ---
+interface SeoIntelligenceSettings {
+  enabled: boolean;   // master toggle — disables all auto-SERP behavior
+  autoOverlay: boolean; // auto-inject SERP overlay on Google SERPs (intrusive — opt-in)
+  autoBadge: boolean;   // auto-update badge/tooltip on SERP detection (non-intrusive)
+}
+const SEO_INTELLIGENCE_DEFAULTS: SeoIntelligenceSettings = { enabled: true, autoOverlay: false, autoBadge: true };
+let seoIntelligenceSettings: SeoIntelligenceSettings = { ...SEO_INTELLIGENCE_DEFAULTS };
+
 // --- Anti-Detection Stealth ---
 let stealthEnabled = false; // default off — user/MCP must explicitly enable via set_stealth_mode
 let stealthScriptId: string | null = null; // Page.addScriptToEvaluateOnNewDocument identifier for cleanup
@@ -869,7 +960,10 @@ const browserContexts = new Set<string>();
 
 // Storage bus helper — writes to chrome.storage.session
 function storageWrite(key: string, data: any) {
-  chrome.storage.session.set({ [key]: data });
+  chrome.storage.session.set({ [key]: data }).catch((err) => {
+    if (__DEV__) console.error(`[Background] storageWrite "${key}" failed:`, err);
+    void chrome.runtime.lastError;
+  });
 }
 
 let statusCache = { mcpConnected: false, capturing: false, activeTabId: null as number | null, activeTabUrl: "", lastCaptureAt: null as string | null };
@@ -924,11 +1018,47 @@ async function ensureTabPermission(commandType: string): Promise<void> {
   }
 }
 
-// Open welcome tab on first install
+// Open welcome tab on first install + re-create context menus (Chrome clears on update)
 chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === "install") {
     chrome.tabs.create({ url: chrome.runtime.getURL("welcome.html") });
   }
+  setupContextMenus().catch(() => {});
+});
+
+// Context menus: setup on SW startup (idempotent) + click dispatch
+setupContextMenus().catch(() => {});
+
+// Load saved SEO intelligence settings (Phase 6)
+chrome.storage.session.get("crawlio:seoIntelligence").then((result) => {
+  if (result["crawlio:seoIntelligence"]) {
+    seoIntelligenceSettings = { ...SEO_INTELLIGENCE_DEFAULTS, ...result["crawlio:seoIntelligence"] };
+  }
+}).catch(() => {});
+
+chrome.contextMenus?.onClicked?.addListener((info, tab) => {
+  handleContextMenuClick(info, tab, {
+    capturePageFn: (tabId) => {
+      if (debuggerAttachedTabId === tabId) {
+        handleCommand({ type: "capture_page", id: "context-menu" }).catch(() => {});
+      }
+    },
+    extractTablesFn: (tabId) => {
+      // Store request — table detection requires MCP orchestration (detect_tables + extract_table)
+      chrome.storage.session.set({ "crawlio:extract-tables": { tabId, requestedAt: new Date().toISOString() } });
+    },
+    analyzeSelectionFn: (text, tabId) => {
+      chrome.storage.session.set({ "crawlio:selection": { text, tabId, capturedAt: new Date().toISOString() } });
+    },
+    startRecordingFn: (tabId) => {
+      if (debuggerAttachedTabId === tabId && !activeRecording) {
+        handleCommand({ type: "start_recording", id: "context-menu" }).catch(() => {});
+      }
+    },
+    seoCheckFn: (tabId) => {
+      chrome.storage.session.set({ "crawlio:seo-check": { tabId, requestedAt: new Date().toISOString() } });
+    },
+  });
 });
 
 chrome.permissions.onAdded.addListener((perms) => {
@@ -941,6 +1071,10 @@ chrome.permissions.onAdded.addListener((perms) => {
   if (perms.permissions?.includes("tabs")) {
     chrome.action.setBadgeText({ text: "" });
     chrome.storage.session.remove("crawlio:pendingPermissions");
+  }
+  // Create context menus when contextMenus permission is granted at runtime
+  if (perms.permissions?.includes("contextMenus")) {
+    setupContextMenus().catch(() => {});
   }
 });
 chrome.permissions.onRemoved.addListener((perms) => {
@@ -1004,7 +1138,11 @@ function flushNetworkToStorage() {
     // Entries keyed by requestId always have it; filter ensures loading finished (_startTime deleted)
     const entries = Array.from(networkEntries.values()).filter(
       (e): e is NetworkMapEntry & { requestId: string } => !!e.url && !e._startTime && !!e.requestId
-    );
+    ).map(e => {
+      if (e.requestHeaders) e.requestHeaders = sanitizeValue(e.requestHeaders) as Record<string, string>;
+      if (e.requestBody) e.requestBody = sanitizeValue(e.requestBody) as string;
+      return e;
+    });
     try {
       await putNetworkEntries(entries);
     } catch { /* IDB write failed — fall back to session storage */
@@ -1221,6 +1359,9 @@ const MAX_PROBE_RETRIES = 3;
 let wasEverConnected = false;
 let userDisconnected = false;
 
+// Cached tokens from health probes — keyed by port
+const bridgeTokens = new Map<number, string>();
+
 async function probePort(port: number): Promise<boolean> {
   try {
     const res = await fetch(`http://${WS_HOST}:${port}/health`, {
@@ -1229,7 +1370,11 @@ async function probePort(port: number): Promise<boolean> {
     });
     if (!res.ok) return false;
     const body = await res.json();
-    return body.service === "crawlio-mcp";
+    if (body.service === "crawlio-mcp") {
+      if (body.token) bridgeTokens.set(port, body.token);
+      return true;
+    }
+    return false;
   } catch { /* fetch failed — server unreachable */
     return false;
   }
@@ -1345,7 +1490,9 @@ function connectToPort(port: number) {
   if (wsBridges.has(port) || connectingPorts.has(port)) return;
   connectingPorts.add(port);
 
-  const socket = new WebSocket(`ws://${WS_HOST}:${port}`);
+  const token = bridgeTokens.get(port);
+  const wsUrl = token ? `ws://${WS_HOST}:${port}?token=${token}` : `ws://${WS_HOST}:${port}`;
+  const socket = new WebSocket(wsUrl);
   let wasOpen = false;
 
   socket.onopen = () => {
@@ -1432,6 +1579,9 @@ function connectToPort(port: number) {
 }
 
 async function discoverAndConnectAll() {
+  // Ensure reconnect alarm exists so we always retry, even if this probe fails
+  chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
+
   // Try native messaging first
   const nativeConnected = await connectNative();
   if (nativeConnected) {
@@ -2491,6 +2641,7 @@ async function handleCommandWithRecording(command: any): Promise<any> {
       activeRecording = {
         sessionId,
         startedAt,
+        _startedAtMs: Date.now(),
         tabId,
         initialUrl: tabUrl,
         maxDurationSec,
@@ -2522,6 +2673,7 @@ async function handleCommandWithRecording(command: any): Promise<any> {
         if (lastAutoStoppedSession) {
           const session = lastAutoStoppedSession;
           lastAutoStoppedSession = null;
+          if (lastAutoStoppedTimer) { clearTimeout(lastAutoStoppedTimer); lastAutoStoppedTimer = null; }
           return { type: "response", id, success: true, data: session };
         }
         return { type: "response", id, success: false, error: "No active recording to stop." };
@@ -2564,14 +2716,23 @@ async function handleCommandWithRecording(command: any): Promise<any> {
       startNewRecordingPage(result.data.url, result.data.title);
     }
 
-    // Record the interaction
+    // Record the interaction (cap payload at 100KB)
     const { type: _, id: _id, ...args } = command;
+    let interactionResult = result?.data;
+    if (interactionResult != null) {
+      try {
+        const serialized = JSON.stringify(interactionResult);
+        if (serialized.length > 100_000) {
+          interactionResult = { _truncated: true, originalSize: serialized.length, type: typeof interactionResult };
+        }
+      } catch { /* non-serializable — keep as-is */ }
+    }
     const currentPage = activeRecording.pages[activeRecording.pages.length - 1];
     currentPage.interactions.push({
       timestamp: new Date().toISOString(),
       tool: type,
       args,
-      result: result?.data,
+      result: interactionResult,
       durationMs,
       pageUrl,
       source: "mcp",
@@ -2589,8 +2750,37 @@ async function handleCommandWithRecording(command: any): Promise<any> {
   return handleCommand(command);
 }
 
+// CF-5: Lightweight WS command validation (defense-in-depth)
+const BLOCKED_URL_SCHEMES = /^(file|chrome|chrome-extension|about|data|javascript):/i;
+const MAX_EXPRESSION_LENGTH = 100_000; // 100KB
+const MAX_SELECTOR_LENGTH = 1000;
+
+function validateCommand(command: any): string | null {
+  // Validate URL fields
+  for (const key of ["url", "targetUrl"]) {
+    if (typeof command[key] === "string" && BLOCKED_URL_SCHEMES.test(command[key])) {
+      return `Blocked URL scheme in ${key}. Only http: and https: URLs are allowed.`;
+    }
+  }
+  // Validate expression length
+  if (typeof command.expression === "string" && command.expression.length > MAX_EXPRESSION_LENGTH) {
+    return `Expression exceeds ${MAX_EXPRESSION_LENGTH} character limit.`;
+  }
+  // Validate selector length
+  if (typeof command.selector === "string" && command.selector.length > MAX_SELECTOR_LENGTH) {
+    return `Selector exceeds ${MAX_SELECTOR_LENGTH} character limit.`;
+  }
+  return null;
+}
+
 async function handleCommand(command: any): Promise<any> {
   const { type, id } = command;
+
+  // CF-5: Validate command fields before processing
+  const validationError = validateCommand(command);
+  if (validationError) {
+    return { type: "response", id, success: false, error: validationError };
+  }
 
   try {
     switch (type) {
@@ -3154,6 +3344,12 @@ async function handleCommand(command: any): Promise<any> {
         const targetUrl = command.url as string | undefined;
         if (!targetUrl) {
           return { type: "response", id, success: false, error: "url is required" };
+        }
+
+        // Block dangerous URL schemes (SSRF defense-in-depth)
+        const BLOCKED_SCHEMES = /^(file|chrome|chrome-extension|about|data|javascript):/i;
+        if (BLOCKED_SCHEMES.test(targetUrl)) {
+          return { type: "response", id, success: false, error: `Blocked URL scheme. Only http: and https: URLs are allowed.` };
         }
 
         // Find the captured request by URL
@@ -3798,7 +3994,7 @@ async function handleCommand(command: any): Promise<any> {
         }});
         // Auto-snapshot after navigation
         let snapshot: string | undefined;
-        try { snapshot = await generateAriaSnapshot(tab.id!); } catch { /* snapshot optional */ }
+        try { snapshot = (await generateAriaSnapshot(tab.id!)).snapshot; } catch { /* snapshot optional */ }
         return {
           type: "response", id, success: true,
           data: { action: "navigate", url: updated.url, title: updated.title, snapshot },
@@ -3841,7 +4037,7 @@ async function handleCommand(command: any): Promise<any> {
         }
         await waitForStableDOM(tab.id!);
         let snapshot: string | undefined;
-        try { snapshot = await generateAriaSnapshot(tab.id!); } catch { /* snapshot optional */ }
+        try { snapshot = (await generateAriaSnapshot(tab.id!)).snapshot; } catch { /* snapshot optional */ }
         return {
           type: "response", id, success: true,
           data: { action: "click", selector: resolvedSelector ?? ref, x: x!, y: y!, snapshot },
@@ -3885,7 +4081,7 @@ async function handleCommand(command: any): Promise<any> {
         if (submit) await dispatchKey(tab.id!, "Enter");
         await waitForStableDOM(tab.id!);
         let snapshot: string | undefined;
-        try { snapshot = await generateAriaSnapshot(tab.id!); } catch { /* snapshot optional */ }
+        try { snapshot = (await generateAriaSnapshot(tab.id!)).snapshot; } catch { /* snapshot optional */ }
         return {
           type: "response", id, success: true,
           data: { action: "type", selector: selector ?? ref, text, clearFirst: !!clearFirst, snapshot },
@@ -3902,7 +4098,7 @@ async function handleCommand(command: any): Promise<any> {
         await dispatchKey(tab.id!, key, keyModBits);
         await waitForStableDOM(tab.id!);
         let snapshot: string | undefined;
-        try { snapshot = await generateAriaSnapshot(tab.id!); } catch { /* snapshot optional */ }
+        try { snapshot = (await generateAriaSnapshot(tab.id!)).snapshot; } catch { /* snapshot optional */ }
         return {
           type: "response", id, success: true,
           data: { action: "press_key", key, snapshot },
@@ -3941,7 +4137,7 @@ async function handleCommand(command: any): Promise<any> {
         }
         await waitForStableDOM(tab.id!);
         let snapshot: string | undefined;
-        try { snapshot = await generateAriaSnapshot(tab.id!); } catch { /* snapshot optional */ }
+        try { snapshot = (await generateAriaSnapshot(tab.id!)).snapshot; } catch { /* snapshot optional */ }
         return {
           type: "response", id, success: true,
           data: { action: "hover", selector: selector ?? ref, x, y, snapshot },
@@ -3960,9 +4156,9 @@ async function handleCommand(command: any): Promise<any> {
         if (ref) {
           // Ref-based: scroll element into view using resolveAriaRef
           const { x, y } = await resolveAriaRef(tab.id!, ref);
-          // Scroll element into view via JS
+          // Scroll element into view via JS (resolveAriaRef already scrolls, but scroll to center)
           const backendNodeId = tabAriaState.get(tab.id!)?.refMap.get(ref);
-          if (backendNodeId) {
+          if (backendNodeId && backendNodeId !== -1) {
             const resolved = await sendCDPCommand<{ object: { objectId?: string } }>(
               { tabId: tab.id! }, "DOM.resolveNode", { backendNodeId }
             );
@@ -4018,7 +4214,7 @@ async function handleCommand(command: any): Promise<any> {
 
         await waitForStableDOM(tab.id!);
         let snapshot: string | undefined;
-        try { snapshot = await generateAriaSnapshot(tab.id!); } catch { /* snapshot optional */ }
+        try { snapshot = (await generateAriaSnapshot(tab.id!)).snapshot; } catch { /* snapshot optional */ }
         return {
           type: "response", id, success: true,
           data: { action: "scroll", deltaX, deltaY, selector: selector ?? ref ?? null, snapshot },
@@ -4183,16 +4379,24 @@ async function handleCommand(command: any): Promise<any> {
         let result: any;
         if (ref) {
           const backendNodeId = tabAriaState.get(tab.id!)?.refMap.get(ref);
-          if (!backendNodeId) throw new Error(`Element ref '${ref}' not found. Run browser_snapshot to refresh.`);
+          if (backendNodeId === undefined) throw new Error(`Element ref '${ref}' not found. Run browser_snapshot to refresh.`);
           await ensureDebugger(tab.id!);
-          const resolved = await sendCDPCommand<{ object: { objectId?: string } }>(
-            { tabId: tab.id! }, "DOM.resolveNode", { backendNodeId }
-          );
-          if (!resolved.object.objectId) throw new Error(`Could not resolve ref '${ref}' to DOM node`);
+          let objectId: string | undefined;
+          if (backendNodeId === -1) {
+            const cssSelector = tabAriaState.get(tab.id!)?.refSelectorMap.get(ref);
+            if (!cssSelector) throw new Error(`Element ref '${ref}' has no CSS selector. Run browser_snapshot to refresh.`);
+            objectId = await resolveCssSelectorToObjectId(tab.id!, cssSelector);
+          } else {
+            const resolved = await sendCDPCommand<{ object: { objectId?: string } }>(
+              { tabId: tab.id! }, "DOM.resolveNode", { backendNodeId }
+            );
+            objectId = resolved.object.objectId;
+          }
+          if (!objectId) throw new Error(`Could not resolve ref '${ref}' to DOM node`);
           const selectResult = await sendCDPCommand<{ result: { value: any } }>(
             { tabId: tab.id! }, "Runtime.callFunctionOn",
             {
-              objectId: resolved.object.objectId,
+              objectId,
               functionDeclaration: `function(value) {
                 if (this.tagName !== 'SELECT') throw new Error('Element is not a <select>');
                 const prev = this.value;
@@ -4216,7 +4420,7 @@ async function handleCommand(command: any): Promise<any> {
         }
         await waitForStableDOM(tab.id!);
         let snapshot: string | undefined;
-        try { snapshot = await generateAriaSnapshot(tab.id!); } catch { /* snapshot optional */ }
+        try { snapshot = (await generateAriaSnapshot(tab.id!)).snapshot; } catch { /* snapshot optional */ }
         return {
           type: "response", id, success: true,
           data: { action: "select_option", selector: selector ?? ref, ...result, snapshot },
@@ -4780,6 +4984,20 @@ async function handleCommand(command: any): Promise<any> {
         return { type: "response", id, success: true, data: { stealthEnabled } };
       }
 
+      // --- SEO Intelligence Settings (Phase 6) ---
+      case "set_seo_intelligence": {
+        const prev = { ...seoIntelligenceSettings };
+        if (typeof command.enabled === "boolean") seoIntelligenceSettings.enabled = command.enabled;
+        if (typeof command.autoOverlay === "boolean") seoIntelligenceSettings.autoOverlay = command.autoOverlay;
+        if (typeof command.autoBadge === "boolean") seoIntelligenceSettings.autoBadge = command.autoBadge;
+        await chrome.storage.session.set({ "crawlio:seoIntelligence": { ...seoIntelligenceSettings } });
+        return { type: "response", id, success: true, data: { previous: prev, current: { ...seoIntelligenceSettings } } };
+      }
+
+      case "get_seo_intelligence": {
+        return { type: "response", id, success: true, data: { ...seoIntelligenceSettings } };
+      }
+
       case "emulate_network": {
         const tabId = await requireDebuggerTab();
 
@@ -4906,8 +5124,12 @@ async function handleCommand(command: any): Promise<any> {
 
       case "set_outer_html": {
         const tabId = await requireDebuggerTab();
+        const html = command.html as string;
+        if (!command.dangerous && /<script|<iframe|on[a-z]+\s*=/i.test(html)) {
+          return { type: "response", id, success: false, error: "HTML contains potentially dangerous content (<script>, <iframe>, or event handlers). Set dangerous: true to allow." };
+        }
         const nodeId = await resolveNodeId(tabId, command.selector as string);
-        await sendCDPCommand({ tabId: tabId }, "DOM.setOuterHTML", { nodeId, outerHTML: command.html as string });
+        await sendCDPCommand({ tabId: tabId }, "DOM.setOuterHTML", { nodeId, outerHTML: html });
         return { type: "response", id, success: true, data: { action: "set_outer_html", selector: command.selector } };
       }
 
@@ -4959,14 +5181,34 @@ async function handleCommand(command: any): Promise<any> {
           return { type: "response", id, success: false, error: "CSS domain unavailable via chrome.debugger — cannot retrieve coverage results" };
         }
         cssCoverageActive = false;
-        const rules = (coverageResult.ruleUsage ?? []).map((r) => ({
-          styleSheetId: r.styleSheetId,
-          startOffset: r.startOffset,
-          endOffset: r.endOffset,
-          used: r.used,
+        const rawRules = coverageResult.ruleUsage ?? [];
+        // Summarize per-stylesheet (match JS coverage pattern)
+        const sheetMap = new Map<string, { totalBytes: number; usedBytes: number }>();
+        for (const r of rawRules) {
+          let sheet = sheetMap.get(r.styleSheetId);
+          if (!sheet) { sheet = { totalBytes: 0, usedBytes: 0 }; sheetMap.set(r.styleSheetId, sheet); }
+          const size = r.endOffset - r.startOffset;
+          sheet.totalBytes += size;
+          if (r.used) sheet.usedBytes += size;
+        }
+        const stylesheets = [...sheetMap.entries()].map(([styleSheetId, s]) => ({
+          styleSheetId,
+          totalBytes: s.totalBytes,
+          usedBytes: s.usedBytes,
+          coveragePercent: s.totalBytes > 0 ? Math.round((s.usedBytes / s.totalBytes) * 100) : 0,
         }));
-        const usedCount = rules.filter((r) => r.used).length;
-        return { type: "response", id, success: true, data: { rules, totalRules: rules.length, usedRules: usedCount, unusedRules: rules.length - usedCount } };
+        const cssTotalBytes = stylesheets.reduce((sum, s) => sum + s.totalBytes, 0);
+        const cssTotalUsed = stylesheets.reduce((sum, s) => sum + s.usedBytes, 0);
+        return { type: "response", id, success: true, data: {
+          stylesheets,
+          summary: {
+            totalStylesheets: stylesheets.length,
+            totalRules: rawRules.length,
+            totalBytes: cssTotalBytes,
+            usedBytes: cssTotalUsed,
+            overallCoveragePercent: cssTotalBytes > 0 ? Math.round((cssTotalUsed / cssTotalBytes) * 100) : 0,
+          },
+        } };
       }
 
       // --- AC-22: JS Code Coverage ---
@@ -5320,11 +5562,19 @@ async function handleCommand(command: any): Promise<any> {
         const tabId = await requireDebuggerTab();
 
         const chunks: string[] = [];
+        const HEAP_SNAPSHOT_MAX_BYTES = 50 * 1024 * 1024; // 50MB
+        let heapTotalSize = 0;
+        let heapSizeExceeded = false;
 
         // Register temporary event listener to collect snapshot chunks
         // Review fix: guard params?.chunk to prevent undefined in array
         const chunkListener = (source: chrome.debugger.Debuggee, method: string, params: any) => {
           if (source.tabId === tabId && method === "HeapProfiler.addHeapSnapshotChunk" && params?.chunk) {
+            heapTotalSize += params.chunk.length;
+            if (heapTotalSize > HEAP_SNAPSHOT_MAX_BYTES) {
+              heapSizeExceeded = true;
+              return; // Stop collecting chunks
+            }
             chunks.push(params.chunk);
           }
         };
@@ -5335,6 +5585,11 @@ async function handleCommand(command: any): Promise<any> {
             reportProgress: false,
             treatGlobalObjectsAsRoots: true,
           }, 0, 25000); // 25s timeout for snapshot collection
+
+          // Abort if snapshot exceeded size cap
+          if (heapSizeExceeded) {
+            return { type: "response", id, success: false, error: `Heap snapshot exceeded ${HEAP_SNAPSHOT_MAX_BYTES / (1024 * 1024)}MB limit (collected ${Math.round(heapTotalSize / (1024 * 1024))}MB). Use Chrome DevTools for large heap analysis.` };
+          }
 
           // Review fix: distinguish empty collection from parsing failure
           if (chunks.length === 0) {
@@ -5405,7 +5660,7 @@ async function handleCommand(command: any): Promise<any> {
           return { type: "response", id, success: true, data: { selector: command.selector } };
         } catch {
           // Fallback: inject absolute-positioned highlight div via Runtime.evaluate
-          const color = command.color ?? "#6fa8dc";
+          const color = /^#?[0-9a-fA-F]{6}$/.test(command.color as string) ? command.color : "#6fa8dc";
           const evalResult = await sendCDPCommand<{ result: { value: string } }>(
             { tabId: tabId }, "Runtime.evaluate",
             buildEvalParams(tabId, `(() => {
@@ -5462,7 +5717,7 @@ async function handleCommand(command: any): Promise<any> {
         for (const field of fields) {
           const fieldType = field.type || "textbox";
           const backendNodeId = tabAriaState.get(tab.id!)?.refMap.get(field.ref);
-          if (!backendNodeId) {
+          if (backendNodeId === undefined) {
             results.push({ ref: field.ref, status: "error: ref not found" });
             continue;
           }
@@ -5497,7 +5752,7 @@ async function handleCommand(command: any): Promise<any> {
 
         await waitForStableDOM(tab.id!);
         let snapshot: string | undefined;
-        try { snapshot = await generateAriaSnapshot(tab.id!); } catch { /* snapshot optional */ }
+        try { snapshot = (await generateAriaSnapshot(tab.id!)).snapshot; } catch { /* snapshot optional */ }
         return {
           type: "response", id, success: true,
           data: { action: "fill_form", fields: results, snapshot },
@@ -5509,8 +5764,32 @@ async function handleCommand(command: any): Promise<any> {
         if (await checkSiteOptOut(tab.id!)) {
           return { type: "response", id, success: false, error: OPT_OUT_ERROR };
         }
-        const snapshot = await generateAriaSnapshot(tab.id!);
-        return { type: "response", id, success: true, data: { snapshot } };
+        const snapshotOpts: SnapshotOptions = {};
+        if (command.interactive === true) snapshotOpts.interactive = true;
+        if (command.compact === true) snapshotOpts.compact = true;
+        if (typeof command.maxDepth === "number") snapshotOpts.maxDepth = Math.max(0, Math.min(command.maxDepth, 50));
+        if (typeof command.selector === "string" && command.selector) snapshotOpts.selector = command.selector;
+        const result = await generateAriaSnapshot(tab.id!, snapshotOpts);
+        // Cache snapshot for diff_snapshot auto-compare
+        getAriaState(tab.id!).lastSnapshot = result.snapshot;
+        return { type: "response", id, success: true, data: { snapshot: result.snapshot, estimatedTokens: result.estimatedTokens } };
+      }
+
+      case "diff_snapshot": {
+        const tab = await getConnectedTab();
+        if (await checkSiteOptOut(tab.id!)) {
+          return { type: "response", id, success: false, error: OPT_OUT_ERROR };
+        }
+        const currentResult = await generateAriaSnapshot(tab.id!);
+        const currentSnapshot = currentResult.snapshot;
+        const ariaState = getAriaState(tab.id!);
+        const baseline = typeof command.baseline === "string" ? command.baseline : ariaState.lastSnapshot;
+        // Update cache with current snapshot
+        ariaState.lastSnapshot = currentSnapshot;
+        if (!baseline) {
+          return { type: "response", id, success: false, error: "No baseline snapshot available. Take a browser_snapshot first, or provide a baseline string." };
+        }
+        return { type: "response", id, success: true, data: { baseline, current: currentSnapshot } };
       }
 
       case "wait_for_network_idle": {
@@ -5543,6 +5822,134 @@ async function handleCommand(command: any): Promise<any> {
         return { type: "response", id, success: true, data: result };
       }
 
+      case "parse_tracking_pixels": {
+        const entries = Array.from(networkEntries.values()).filter(e => e.url && !e._startTime);
+        const events: Array<Record<string, unknown>> = [];
+        const unrecognizedTrackingUrls: string[] = [];
+        const seenUnrecognized = new Set<string>();
+
+        for (const entry of entries) {
+          let matched = false;
+          for (const config of Object.values(TRACKER_VENDORS)) {
+            for (const pattern of config.urlPatterns) {
+              if (pattern.test(entry.url)) {
+                matched = true;
+                let parsed: URL | undefined;
+                try { parsed = new URL(entry.url); } catch { break; }
+                const pixelId = config.extractPixelId(parsed) || "unknown";
+                const eventName = config.extractEventName(parsed) || "unknown";
+                const parameters = config.extractParameters(parsed);
+                const eventType = config.standardEvents.includes(eventName) ? "standard" : "custom";
+                events.push({
+                  vendor: config.vendor,
+                  pixelId,
+                  eventName,
+                  eventType,
+                  parameters,
+                  url: entry.url,
+                  method: entry.method,
+                  timestamp: Date.now(),
+                  status: entry.status > 0 ? entry.status : undefined,
+                  requestUrl: entry.url,
+                });
+                break;
+              }
+            }
+            if (matched) break;
+          }
+          if (!matched && !seenUnrecognized.has(entry.url)) {
+            for (const hp of TRACKING_HEURISTIC_PATTERNS) {
+              if (hp.test(entry.url)) {
+                seenUnrecognized.add(entry.url);
+                unrecognizedTrackingUrls.push(entry.url);
+                break;
+              }
+            }
+          }
+        }
+
+        // Group by vendor + pixelId
+        const pixelMap = new Map<string, Record<string, unknown>>();
+        const vendorSet = new Set<string>();
+        for (const event of events) {
+          vendorSet.add(event.vendor as string);
+          const key = `${event.vendor}:${event.pixelId}`;
+          let summary = pixelMap.get(key);
+          if (!summary) {
+            summary = {
+              vendor: event.vendor,
+              pixelId: event.pixelId,
+              eventCount: 0,
+              events: [] as Record<string, unknown>[],
+              uniqueEventNames: [] as string[],
+            };
+            pixelMap.set(key, summary);
+          }
+          (summary.events as Record<string, unknown>[]).push(event);
+          summary.eventCount = (summary.eventCount as number) + 1;
+          const names = summary.uniqueEventNames as string[];
+          if (!names.includes(event.eventName as string)) {
+            names.push(event.eventName as string);
+          }
+        }
+
+        return {
+          type: "response",
+          id,
+          success: true,
+          data: {
+            totalPixelFires: events.length,
+            vendors: Array.from(vendorSet),
+            pixels: Array.from(pixelMap.values()),
+            events,
+            unrecognizedTrackingUrls,
+          },
+        };
+      }
+
+      case "inspect_datalayer": {
+        const tab = await getConnectedTab();
+        await ensureDebugger(tab.id!);
+        if (await checkSiteOptOut(tab.id!)) {
+          return { type: "response", id, success: false, error: OPT_OUT_ERROR };
+        }
+        await CDP_YIELD();
+        const dlResult = await cdpExecuteFunction<{
+          facebook: { loaded: boolean; version: string | null; pixelIds: string[]; queueLength: number } | null;
+          ga4: { dataLayerLength: number; events: string[]; gtag: boolean; gaLegacy: boolean } | null;
+          gtm: { containers: string[] } | null;
+          tiktok: { loaded: boolean; queueLength: number } | null;
+        }>(tab.id!, inspectDataLayer);
+        return { type: "response", id, success: true, data: dlResult || { facebook: null, ga4: null, gtm: null, tiktok: null } };
+      }
+
+      case "inject_serp_overlay": {
+        const tab = await getConnectedTab();
+        await ensureDebugger(tab.id!);
+        if (await checkSiteOptOut(tab.id!)) {
+          return { type: "response", id, success: false, error: OPT_OUT_ERROR };
+        }
+        const widgets = (command.widgets as string[]) || ["badge", "header", "sidebar"];
+        const query = (command.query as string) || "";
+        const data = (command.data as Record<string, unknown>) || {};
+        const result = await cdpExecuteFunction<{ injected: boolean; widgetCount: number; query: string }>(
+          tab.id!, injectSerpOverlay, [{ widgets, query, css: SERP_OVERLAY_CSS, data }]
+        );
+        if (!result) {
+          return { type: "response", id, success: false, error: "Failed to inject SERP overlay — page may have navigated" };
+        }
+        return { type: "response", id, success: true, data: result };
+      }
+
+      case "clear_serp_overlay": {
+        const tab = await getConnectedTab();
+        await ensureDebugger(tab.id!);
+        const result = await cdpExecuteFunction<{ cleared: boolean; reason?: string }>(
+          tab.id!, removeSerpOverlay, []
+        );
+        return { type: "response", id, success: true, data: result || { cleared: false, reason: "CDP evaluate failed" } };
+      }
+
       case "get_enrichment": {
         const queryUrl = command.url as string | undefined;
         if (queryUrl) {
@@ -5571,6 +5978,183 @@ async function handleCommand(command: any): Promise<any> {
         return { type: "response", id, success: true, data: { entries: all, count: all.length } };
       }
 
+      case "compare_raw_rendered": {
+        const tab = await getConnectedTab();
+        await ensureDebugger(tab.id!);
+
+        // 1. Find the main document request in networkEntries
+        let rawHtml = "";
+        let rawSource = "none";
+        const pageUrl = tab.url || "";
+
+        // Try Network.getResponseBody for the document request
+        for (const [reqId, entry] of networkEntries) {
+          if (entry.resourceType === "Document" && entry.url === pageUrl) {
+            try {
+              const resp = await sendCDPCommand<{ body: string; base64Encoded: boolean }>(
+                { tabId: tab.id! }, "Network.getResponseBody", { requestId: reqId }
+              );
+              if (!resp.base64Encoded && resp.body) {
+                rawHtml = resp.body;
+                rawSource = "network-cache";
+              }
+            } catch { /* response body evicted — fall through to fetch */ }
+            break;
+          }
+        }
+
+        // Fallback: fetch in page context (same-origin, inherits cookies/auth)
+        if (!rawHtml) {
+          try {
+            const fetchResult = await sendCDPCommand<{ result: { type: string; value?: string } }>(
+              { tabId: tab.id! }, "Runtime.evaluate", {
+                expression: `fetch(location.href, { credentials: 'include' }).then(r => r.text())`,
+                awaitPromise: true,
+                returnByValue: true,
+              }
+            );
+            if (fetchResult.result?.value) {
+              rawHtml = fetchResult.result.value;
+              rawSource = "fetch-in-page";
+            }
+          } catch { /* fetch failed */ }
+        }
+
+        if (!rawHtml) {
+          return { type: "response", id, success: false, data: { error: "Could not retrieve raw HTML. Ensure network capture was active when the page loaded, or the page allows same-origin fetch." } };
+        }
+
+        // 2. Capture rendered DOM + SEO elements via Runtime.evaluate
+        const renderResult = await sendCDPCommand<{ result: { type: string; value?: unknown } }>(
+          { tabId: tab.id! }, "Runtime.evaluate", {
+            expression: `(() => {
+  const renderedHtml = document.documentElement.outerHTML;
+  const title = document.title || null;
+  const descEl = document.querySelector('meta[name="description"]');
+  const metaDescription = descEl ? descEl.getAttribute("content") : null;
+  const canEl = document.querySelector('link[rel="canonical"]');
+  const canonical = canEl ? canEl.getAttribute("href") : null;
+  const headings = Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6")).map(h => ({
+    level: parseInt(h.tagName.substring(1), 10),
+    text: (h.textContent || "").trim().substring(0, 200)
+  }));
+  const linkCount = document.querySelectorAll("a[href]").length;
+  const jsonLdScripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+  const structuredData = jsonLdScripts.map(s => { try { return JSON.parse(s.textContent || ""); } catch { return null; } }).filter(Boolean);
+  const bodyText = (document.body?.innerText || "").trim();
+  return {
+    renderedHtml,
+    seoElements: {
+      title,
+      metaDescription,
+      canonical,
+      headings,
+      linkCount,
+      structuredData,
+      contentLength: renderedHtml.length,
+      textLength: bodyText.length,
+    }
+  };
+})()`,
+            returnByValue: true,
+          }
+        );
+
+        const rendered = (renderResult.result?.value || {}) as Record<string, unknown>;
+        const renderedHtml = (rendered.renderedHtml as string) || "";
+        const renderedSeo = (rendered.seoElements || {}) as Record<string, unknown>;
+
+        // 3. Parse SEO elements from raw HTML (regex-based, no DOM in service worker)
+        const rawTitle = (rawHtml.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "").trim() || null;
+        const rawDescMatch = rawHtml.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']*)["']/i)
+          || rawHtml.match(/<meta[^>]*content=["']([^"']*)["'][^>]*name=["']description["']/i);
+        const rawMetaDescription = rawDescMatch?.[1] || null;
+        const rawCanMatch = rawHtml.match(/<link[^>]*rel=["']canonical["'][^>]*href=["']([^"']*)["']/i)
+          || rawHtml.match(/<link[^>]*href=["']([^"']*)["'][^>]*rel=["']canonical["']/i);
+        const rawCanonical = rawCanMatch?.[1] || null;
+        const rawHeadings: Array<{ level: number; text: string }> = [];
+        const headingRe = /<(h[1-6])[^>]*>([\s\S]*?)<\/\1>/gi;
+        let hMatch: RegExpExecArray | null;
+        while ((hMatch = headingRe.exec(rawHtml)) !== null) {
+          rawHeadings.push({ level: parseInt(hMatch[1].substring(1), 10), text: hMatch[2].replace(/<[^>]*>/g, "").trim().substring(0, 200) });
+        }
+        const rawLinkCount = (rawHtml.match(/<a\s[^>]*href=/gi) || []).length;
+        const rawJsonLdRe = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+        const rawStructuredData: unknown[] = [];
+        let jMatch: RegExpExecArray | null;
+        while ((jMatch = rawJsonLdRe.exec(rawHtml)) !== null) {
+          try { rawStructuredData.push(JSON.parse(jMatch[1])); } catch { /* malformed JSON-LD */ }
+        }
+        const rawTextLength = rawHtml.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim().length;
+
+        const rawSeo = {
+          title: rawTitle,
+          metaDescription: rawMetaDescription,
+          canonical: rawCanonical,
+          headings: rawHeadings,
+          linkCount: rawLinkCount,
+          structuredData: rawStructuredData,
+          contentLength: rawHtml.length,
+          textLength: rawTextLength,
+        };
+
+        // 4. Compute differences
+        const differences: Array<{ element: string; raw: unknown; rendered: unknown; impact: string; description: string }> = [];
+
+        if (rawSeo.title !== renderedSeo.title) {
+          differences.push({ element: "title", raw: rawSeo.title, rendered: renderedSeo.title, impact: "high", description: rawSeo.title ? "Title changed by JavaScript" : "Title set entirely by JavaScript" });
+        }
+        if (rawSeo.metaDescription !== renderedSeo.metaDescription) {
+          differences.push({ element: "metaDescription", raw: rawSeo.metaDescription, rendered: renderedSeo.metaDescription, impact: "high", description: rawSeo.metaDescription ? "Meta description changed by JavaScript" : "Meta description set entirely by JavaScript" });
+        }
+        if (rawSeo.canonical !== renderedSeo.canonical) {
+          differences.push({ element: "canonical", raw: rawSeo.canonical, rendered: renderedSeo.canonical, impact: "high", description: rawSeo.canonical ? "Canonical URL changed by JavaScript" : "Canonical URL set entirely by JavaScript" });
+        }
+
+        const renderedHeadings = (renderedSeo.headings as Array<{ level: number; text: string }>) || [];
+        if (rawSeo.headings.length !== renderedHeadings.length) {
+          differences.push({ element: "headings", raw: rawSeo.headings.length, rendered: renderedHeadings.length, impact: "medium", description: `Heading count changed: ${rawSeo.headings.length} raw → ${renderedHeadings.length} rendered` });
+        }
+
+        const renderedLinkCount = (renderedSeo.linkCount as number) || 0;
+        if (Math.abs(rawSeo.linkCount - renderedLinkCount) > 5) {
+          differences.push({ element: "links", raw: rawSeo.linkCount, rendered: renderedLinkCount, impact: "medium", description: `Link count changed: ${rawSeo.linkCount} raw → ${renderedLinkCount} rendered` });
+        }
+
+        const renderedSD = (renderedSeo.structuredData as unknown[]) || [];
+        if (rawSeo.structuredData.length !== renderedSD.length) {
+          differences.push({ element: "structuredData", raw: rawSeo.structuredData.length, rendered: renderedSD.length, impact: "high", description: rawSeo.structuredData.length === 0 ? "Structured data injected entirely by JavaScript" : `Structured data count changed: ${rawSeo.structuredData.length} raw → ${renderedSD.length} rendered` });
+        }
+
+        const renderedContentLength = (renderedSeo.contentLength as number) || 0;
+        const sizeDelta = renderedContentLength - rawSeo.contentLength;
+        const sizeRatio = rawSeo.contentLength > 0 ? Math.abs(sizeDelta) / rawSeo.contentLength : 0;
+        if (sizeRatio > 0.3) {
+          differences.push({ element: "contentSize", raw: rawSeo.contentLength, rendered: renderedContentLength, impact: "low", description: `HTML size changed by ${Math.round(sizeRatio * 100)}%: ${rawSeo.contentLength} → ${renderedContentLength} bytes` });
+        }
+
+        // 5. Assess risk
+        const hasHighImpact = differences.some(d => d.impact === "high");
+        const hasMediumImpact = differences.some(d => d.impact === "medium");
+        const riskLevel = hasHighImpact ? "high" : hasMediumImpact ? "medium" : "low";
+        const jsDependent = differences.length > 0;
+
+        // Cap raw HTML to 100KB for response size
+        const MAX_HTML = 100000;
+        const cappedRawHtml = rawHtml.length > MAX_HTML ? rawHtml.substring(0, MAX_HTML) : rawHtml;
+        const cappedRenderedHtml = renderedHtml.length > MAX_HTML ? renderedHtml.substring(0, MAX_HTML) : renderedHtml;
+
+        return { type: "response", id, success: true, data: {
+          url: pageUrl,
+          rawSource,
+          raw: { html: cappedRawHtml, seoElements: rawSeo, size: rawHtml.length },
+          rendered: { html: cappedRenderedHtml, seoElements: renderedSeo, size: renderedHtml.length },
+          differences,
+          jsDependent,
+          riskLevel,
+        }};
+      }
+
       default:
         return { type: "response", id, success: false, error: `Unknown command: ${type}` };
     }
@@ -5590,8 +6174,9 @@ async function handleCommand(command: any): Promise<any> {
 
 const ARIA_INTERACTIVE_ROLES = new Set([
   "button", "link", "textbox", "checkbox", "radio",
-  "combobox", "slider", "tab", "menuitem", "option",
-  "switch", "searchbox", "spinbutton",
+  "combobox", "listbox", "slider", "tab", "menuitem",
+  "menuitemcheckbox", "menuitemradio", "option",
+  "switch", "searchbox", "spinbutton", "treeitem",
 ]);
 
 const ARIA_LANDMARK_ROLES = new Set([
@@ -5599,20 +6184,216 @@ const ARIA_LANDMARK_ROLES = new Set([
   "contentinfo", "complementary", "form", "region",
 ]);
 
+const ARIA_CONTENT_ROLES = new Set([
+  "heading", "cell", "gridcell", "columnheader", "rowheader",
+  "listitem", "article", "region", "main", "navigation",
+]);
+
+const ARIA_STRUCTURAL_ROLES = new Set([
+  "generic", "group", "list", "table", "row", "rowgroup",
+  "grid", "treegrid", "menu", "menubar", "toolbar",
+  "tablist", "tree", "directory", "document", "application",
+  "presentation", "none",
+]);
+
 const SNAPSHOT_MAX_NODES = 15000;
 
-async function generateAriaSnapshot(tabId: number): Promise<string> {
+interface SnapshotOptions {
+  interactive?: boolean;
+  compact?: boolean;
+  maxDepth?: number;
+  selector?: string;
+}
+
+interface RoleNameTracker {
+  counts: Map<string, number>;
+  refsByKey: Map<string, string[]>;
+  getKey(role: string, name: string): string;
+  track(role: string, name: string, ref: string): number;
+  getDuplicateKeys(): Set<string>;
+}
+
+function createRoleNameTracker(): RoleNameTracker {
+  const counts = new Map<string, number>();
+  const refsByKey = new Map<string, string[]>();
+  return {
+    counts,
+    refsByKey,
+    getKey(role: string, name: string): string {
+      return `${role}:${name}`;
+    },
+    track(role: string, name: string, ref: string): number {
+      const key = this.getKey(role, name);
+      const idx = counts.get(key) ?? 0;
+      counts.set(key, idx + 1);
+      const refs = refsByKey.get(key) ?? [];
+      refs.push(ref);
+      refsByKey.set(key, refs);
+      return idx;
+    },
+    getDuplicateKeys(): Set<string> {
+      const dups = new Set<string>();
+      for (const [key, refs] of refsByKey) {
+        if (refs.length > 1) dups.add(key);
+      }
+      return dups;
+    },
+  };
+}
+
+const MAX_CURSOR_INTERACTIVE = 50;
+
+async function findCursorInteractiveElements(tabId: number): Promise<Array<{ selector: string; name: string }>> {
+  const script = `(() => {
+    const results = [];
+    const interactiveRoles = new Set([
+      'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox', 'listbox',
+      'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'searchbox',
+      'slider', 'spinbutton', 'switch', 'tab', 'treeitem'
+    ]);
+    const interactiveTags = new Set([
+      'a', 'button', 'input', 'select', 'textarea', 'details', 'summary'
+    ]);
+    const skipTags = new Set(['head', 'script', 'style', 'noscript']);
+
+    const buildSelector = (el) => {
+      const testId = el.getAttribute('data-testid');
+      if (testId) return '[data-testid="' + testId + '"]';
+      if (el.id) return '#' + CSS.escape(el.id);
+
+      const path = [];
+      let current = el;
+      while (current && current !== document.body) {
+        let sel = current.tagName.toLowerCase();
+        const classes = Array.from(current.classList).filter(c => c.trim());
+        if (classes.length > 0) sel += '.' + CSS.escape(classes[0]);
+
+        const parent = current.parentElement;
+        if (parent) {
+          const siblings = Array.from(parent.children);
+          const matching = siblings.filter(s => {
+            if (s.tagName !== current.tagName) return false;
+            if (classes.length > 0 && !s.classList.contains(classes[0])) return false;
+            return true;
+          });
+          if (matching.length > 1) {
+            const idx = matching.indexOf(current) + 1;
+            sel += ':nth-of-type(' + idx + ')';
+          }
+        }
+        path.unshift(sel);
+        current = current.parentElement;
+        if (path.length >= 1) {
+          try {
+            const candidate = path.join(' > ');
+            if (document.querySelectorAll(candidate).length === 1) break;
+          } catch (e) {}
+        }
+        if (path.length >= 10) break;
+      }
+      return path.join(' > ');
+    };
+
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+    let el;
+    while ((el = walker.nextNode())) {
+      if (results.length >= ${MAX_CURSOR_INTERACTIVE}) break;
+
+      const tagName = el.tagName.toLowerCase();
+      if (skipTags.has(tagName)) continue;
+      if (interactiveTags.has(tagName)) continue;
+
+      // Skip if inside a skip container
+      let inSkip = false;
+      let p = el.parentElement;
+      while (p) {
+        if (skipTags.has(p.tagName.toLowerCase())) { inSkip = true; break; }
+        p = p.parentElement;
+      }
+      if (inSkip) continue;
+
+      const role = el.getAttribute('role');
+      if (role && interactiveRoles.has(role.toLowerCase())) continue;
+
+      const computedStyle = getComputedStyle(el);
+      const hasCursorPointer = computedStyle.cursor === 'pointer';
+      const hasOnClick = el.hasAttribute('onclick') || el.onclick !== null;
+      const tabIndex = el.getAttribute('tabindex');
+      const hasTabIndex = tabIndex !== null && tabIndex !== '-1';
+
+      if (!hasCursorPointer && !hasOnClick && !hasTabIndex) continue;
+
+      // Skip elements that only inherit cursor:pointer from ancestor
+      if (hasCursorPointer && !hasOnClick && !hasTabIndex) {
+        const parent = el.parentElement;
+        if (parent && getComputedStyle(parent).cursor === 'pointer') continue;
+      }
+
+      // Skip hidden/tiny elements
+      if (el.offsetWidth === 0 || el.offsetHeight === 0) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 10 || rect.height < 10) continue;
+
+      // Derive name
+      const ariaLabel = el.getAttribute('aria-label');
+      const textContent = (el.textContent || '').trim().slice(0, 50);
+      const title = el.getAttribute('title');
+      const name = ariaLabel || textContent || title || tagName;
+      if (!name) continue;
+
+      results.push({ selector: buildSelector(el), name });
+    }
+    return results;
+  })()`;
+
+  try {
+    const result = await sendCDPCommand<{ result: { value: Array<{ selector: string; name: string }> } }>(
+      { tabId }, "Runtime.evaluate",
+      { expression: script, returnByValue: true, timeout: 5000 }, 0, 10000
+    );
+    return result.result?.value || [];
+  } catch {
+    return [];
+  }
+}
+
+async function generateAriaSnapshot(tabId: number, options: SnapshotOptions = {}): Promise<{ snapshot: string; estimatedTokens: number }> {
   await ensureDebugger(tabId);
 
   await sendCDPCommand({ tabId }, "Accessibility.enable", {}, 0, 3000);
 
-  const axParams: Record<string, unknown> = { depth: 50 };
-  if (activeFrameId) axParams.frameId = activeFrameId;
+  let nodes: Array<any>;
 
-  const result = await sendCDPCommand<{ nodes: Array<any> }>(
-    { tabId }, "Accessibility.getFullAXTree", axParams, 0, 15000
-  );
-  const nodes = result.nodes;
+  if (options.selector) {
+    // Scoped snapshot: resolve selector → backendNodeId → partial tree
+    await sendCDPCommand({ tabId }, "DOM.enable", {}, 0, 3000);
+    const docResult = await sendCDPCommand<{ root: { nodeId: number } }>(
+      { tabId }, "DOM.getDocument", { depth: 0 }, 0, 10000
+    );
+    const qResult = await sendCDPCommand<{ nodeId: number }>(
+      { tabId }, "DOM.querySelector",
+      { nodeId: docResult.root.nodeId, selector: options.selector }, 0, 5000
+    );
+    if (!qResult.nodeId) {
+      return { snapshot: `(selector "${options.selector}" not found)`, estimatedTokens: 0 };
+    }
+    const descResult = await sendCDPCommand<{ node: { backendNodeId: number } }>(
+      { tabId }, "DOM.describeNode", { nodeId: qResult.nodeId }, 0, 5000
+    );
+    const partialResult = await sendCDPCommand<{ nodes: Array<any> }>(
+      { tabId }, "Accessibility.getPartialAXTree",
+      { backendNodeId: descResult.node.backendNodeId, fetchRelatives: true }, 0, 15000
+    );
+    nodes = partialResult.nodes;
+  } else {
+    const axParams: Record<string, unknown> = { depth: 50 };
+    if (activeFrameId) axParams.frameId = activeFrameId;
+    const result = await sendCDPCommand<{ nodes: Array<any> }>(
+      { tabId }, "Accessibility.getFullAXTree", axParams, 0, 15000
+    );
+    nodes = result.nodes;
+  }
+
   if (nodes.length > SNAPSHOT_MAX_NODES) {
     nodes.length = SNAPSHOT_MAX_NODES;
   }
@@ -5620,6 +6401,7 @@ async function generateAriaSnapshot(tabId: number): Promise<string> {
   // Reset per-tab ref map for fresh snapshot
   const ariaState = getAriaState(tabId);
   ariaState.refMap = new Map();
+  ariaState.refSelectorMap = new Map();
   ariaState.counter = 0;
 
   // Build parent→children map (CDP childIds are unreliable)
@@ -5701,12 +6483,45 @@ async function generateAriaSnapshot(tabId: number): Promise<string> {
     return false;
   }
 
+  const tracker = createRoleNameTracker();
+
+  // Check if a subtree has any interactive descendants (for compact mode)
+  function hasInteractiveDescendant(node: any): boolean {
+    if (node.ignored || isExtensionNode(node)) return false;
+    const role = node.role?.value || "";
+    if (ARIA_INTERACTIVE_ROLES.has(role)) return true;
+    const children = childrenOf.get(node.nodeId) || [];
+    for (const child of children) {
+      if (hasInteractiveDescendant(child)) return true;
+    }
+    return false;
+  }
+
   function formatNode(node: any, depth: number): string {
     if (node.ignored) return "";
     if (isExtensionNode(node)) return "";
+
+    // Depth limiting
+    if (options.maxDepth !== undefined && depth > options.maxDepth) return "";
+
     const role = node.role?.value || "";
     const name = node.name?.value || "";
     const children = childrenOf.get(node.nodeId) || [];
+    const isInteractive = ARIA_INTERACTIVE_ROLES.has(role);
+    const isContent = ARIA_CONTENT_ROLES.has(role);
+    const isStructural = ARIA_STRUCTURAL_ROLES.has(role);
+    const isLandmark = ARIA_LANDMARK_ROLES.has(role);
+
+    // Interactive-only mode: skip non-interactive nodes but recurse for children
+    if (options.interactive && !isInteractive) {
+      // Still recurse — interactive children may be nested under structural nodes
+      const lines: string[] = [];
+      for (const child of children) {
+        const cl = formatNode(child, depth);
+        if (cl) lines.push(cl);
+      }
+      return lines.join("\n");
+    }
 
     // Presentational/none nodes: promote children
     if (role === "none" || role === "presentation") {
@@ -5735,9 +6550,12 @@ async function generateAriaSnapshot(tabId: number): Promise<string> {
       return formatNode(children[0], depth);
     }
 
+    // Compact mode: skip unnamed structural nodes with no interactive descendants
+    if (options.compact && isStructural && !name && !hasInteractiveDescendant(node)) {
+      return "";
+    }
+
     const indent = "  ".repeat(depth);
-    const isInteractive = ARIA_INTERACTIVE_ROLES.has(role);
-    const isLandmark = ARIA_LANDMARK_ROLES.has(role);
 
     // Truncate long names
     const truncatedName = name.length > 80 ? name.substring(0, 77) + "..." : name;
@@ -5765,18 +6583,23 @@ async function generateAriaSnapshot(tabId: number): Promise<string> {
     if (role === "link") {
       const url = getNodeUrl(node);
       if (url && !url.startsWith("javascript:")) {
-        // Shorten URL for display
         const shortUrl = url.length > 60 ? url.substring(0, 57) + "..." : url;
         label += ` url="${shortUrl}"`;
       }
     }
 
-    // Assign ref to interactive/landmark nodes with backendDOMNodeId
-    if ((isInteractive || (isLandmark && name)) && node.backendDOMNodeId) {
+    // Assign ref to interactive, named content, or named landmark nodes with backendDOMNodeId
+    const shouldRef = isInteractive || (isContent && name) || (isLandmark && name);
+    if (shouldRef && node.backendDOMNodeId) {
       ariaState.counter++;
       const ref = `e${ariaState.counter}`;
+      const resolvedName = name || "";
+      const nth = tracker.track(role, resolvedName, ref);
       ariaState.refMap.set(ref, node.backendDOMNodeId);
-      if (label) label += ` [ref=${ref}]`;
+      if (label) {
+        label += ` [ref=${ref}]`;
+        if (nth > 0) label += ` [nth=${nth}]`;
+      }
     }
 
     // Process children depth-first
@@ -5795,10 +6618,44 @@ async function generateAriaSnapshot(tabId: number): Promise<string> {
     return line;
   }
 
-  if (!rootNode) return "(empty page)";
+  if (!rootNode) {
+    return { snapshot: "(empty page)", estimatedTokens: 0 };
+  }
 
-  const snapshot = formatNode(rootNode, 0);
-  return snapshot || "(empty page)";
+  let snapshot = formatNode(rootNode, 0) || "(empty page)";
+
+  // Post-process: remove nth annotations from refs that have no duplicates
+  const dupKeys = tracker.getDuplicateKeys();
+  // Clean nth from snapshot text for non-duplicate refs
+  // (nth only appears as [nth=N] in the output for elements tracked by RoleNameTracker)
+
+  // Cursor-interactive discovery: find clickable elements without ARIA roles
+  // Only in full mode (not interactive-only, which filters to existing ARIA interactive nodes)
+  if (!options.interactive) {
+    try {
+      const cursorElements = await findCursorInteractiveElements(tabId);
+      if (cursorElements.length > 0) {
+        const cursorLines: string[] = [];
+        for (const el of cursorElements) {
+          ariaState.counter++;
+          const ref = `e${ariaState.counter}`;
+          ariaState.refMap.set(ref, -1);
+          ariaState.refSelectorMap.set(ref, el.selector);
+          const truncatedName = el.name.length > 80 ? el.name.substring(0, 77) + "..." : el.name;
+          cursorLines.push(`- cursor-interactive "${truncatedName}" [ref=${ref}]`);
+        }
+
+        if (cursorLines.length > 0) {
+          snapshot += "\n" + cursorLines.join("\n");
+        }
+      }
+    } catch {
+      // cursor-interactive discovery is best-effort — don't fail the snapshot
+    }
+  }
+
+  const estimatedTokens = Math.ceil(snapshot.length / 4);
+  return { snapshot, estimatedTokens };
 }
 
 async function resolveAriaRef(tabId: number, ref: string): Promise<{ x: number; y: number }> {
@@ -5807,12 +6664,63 @@ async function resolveAriaRef(tabId: number, ref: string): Promise<{ x: number; 
     throw new Error(`No refs available — page may have navigated. Run browser_snapshot first.`);
   }
   const backendNodeId = ariaState.refMap.get(ref);
-  if (!backendNodeId) {
+  if (backendNodeId === undefined) {
     throw new Error(`Element ref '${ref}' not found. Run browser_snapshot to refresh.`);
   }
 
   await ensureDebugger(tabId);
 
+  // Cursor-interactive ref: resolve via CSS selector instead of backendDOMNodeId
+  if (backendNodeId === -1) {
+    const selector = ariaState.refSelectorMap.get(ref);
+    if (!selector) {
+      throw new Error(`Element ref '${ref}' has no CSS selector. Run browser_snapshot to refresh.`);
+    }
+    await sendCDPCommand({ tabId }, "DOM.enable", {}, 0, 3000);
+    const docResult = await sendCDPCommand<{ root: { nodeId: number } }>(
+      { tabId }, "DOM.getDocument", { depth: 0 }, 0, 10000
+    );
+    const qResult = await sendCDPCommand<{ nodeId: number }>(
+      { tabId }, "DOM.querySelector",
+      { nodeId: docResult.root.nodeId, selector }, 0, 5000
+    );
+    if (!qResult.nodeId) {
+      throw new Error(`Element ref '${ref}' is stale (CSS selector no longer matches). Run browser_snapshot to refresh.`);
+    }
+    // Scroll into view
+    try {
+      await sendCDPCommand({ tabId }, "DOM.scrollIntoViewIfNeeded", { nodeId: qResult.nodeId });
+    } catch {
+      try {
+        const resolved = await sendCDPCommand<{ object: { objectId?: string } }>(
+          { tabId }, "DOM.resolveNode", { nodeId: qResult.nodeId }
+        );
+        if (resolved.object.objectId) {
+          await sendCDPCommand({ tabId }, "Runtime.callFunctionOn", {
+            objectId: resolved.object.objectId,
+            functionDeclaration: `function() { this.scrollIntoView({ behavior: 'instant', block: 'end', inline: 'nearest' }); }`,
+          });
+        }
+      } catch { /* best effort scroll */ }
+    }
+    // Get box model
+    let model: { content: number[] };
+    try {
+      const result = await sendCDPCommand<{ model: { content: number[] } }>(
+        { tabId }, "DOM.getBoxModel", { nodeId: qResult.nodeId }
+      );
+      model = result.model;
+    } catch {
+      throw new Error(`Element ref '${ref}' is stale (page may have changed). Run browser_snapshot to refresh.`);
+    }
+    const quad = model.content;
+    return {
+      x: Math.round((quad[0] + quad[2] + quad[4] + quad[6]) / 4),
+      y: Math.round((quad[1] + quad[3] + quad[5] + quad[7]) / 4),
+    };
+  }
+
+  // Standard ARIA ref: resolve via backendDOMNodeId
   // Scroll into view before getBoxModel to ensure element is on-screen
   try {
     await sendCDPCommand({ tabId }, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
@@ -5847,6 +6755,22 @@ async function resolveAriaRef(tabId: number, ref: string): Promise<{ x: number; 
   const y = Math.round((quad[1] + quad[3] + quad[5] + quad[7]) / 4);
 
   return { x, y };
+}
+
+async function resolveCssSelectorToObjectId(tabId: number, selector: string): Promise<string | undefined> {
+  await sendCDPCommand({ tabId }, "DOM.enable", {}, 0, 3000);
+  const docResult = await sendCDPCommand<{ root: { nodeId: number } }>(
+    { tabId }, "DOM.getDocument", { depth: 0 }, 0, 10000
+  );
+  const qResult = await sendCDPCommand<{ nodeId: number }>(
+    { tabId }, "DOM.querySelector",
+    { nodeId: docResult.root.nodeId, selector }, 0, 5000
+  );
+  if (!qResult.nodeId) return undefined;
+  const resolved = await sendCDPCommand<{ object: { objectId?: string } }>(
+    { tabId }, "DOM.resolveNode", { nodeId: qResult.nodeId }
+  );
+  return resolved.object.objectId;
 }
 
 // --- AX tree helpers (AC-13) ---
@@ -6176,7 +7100,11 @@ async function stopNetworkCapture(): Promise<any[]> {
   mainDocResponseHeaders = {};
   const entries = Array.from(networkEntries.values()).filter(
     (e): e is NetworkMapEntry & { requestId: string } => !!e.url && !!e.requestId
-  );
+  ).map(e => {
+    if (e.requestHeaders) e.requestHeaders = sanitizeValue(e.requestHeaders) as Record<string, string>;
+    if (e.requestBody) e.requestBody = sanitizeValue(e.requestBody) as string;
+    return e;
+  });
 
   if (debuggerAttachedTabId !== null) {
     try {
@@ -6440,6 +7368,12 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
         _startTime: timestamp,
         _seq: networkCaptureSeq++,
       });
+      // FIFO eviction: keep at most 2x SESSION_NETWORK_CAP entries
+      if (networkEntries.size > SESSION_NETWORK_CAP * 2) {
+        const sorted = [...networkEntries.entries()].sort((a, b) => (a[1]._seq ?? 0) - (b[1]._seq ?? 0));
+        const toDelete = sorted.slice(0, networkEntries.size - SESSION_NETWORK_CAP);
+        for (const [key] of toDelete) networkEntries.delete(key);
+      }
       break;
     }
     case "Network.responseReceived": {
@@ -6652,6 +7586,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
     // Browser-level logs (404, CORS, CSP) via Log.enable
     case "Log.entryAdded": {
       const entry = params.entry;
+      if (consoleLogs.length >= SESSION_CONSOLE_CAP) consoleLogs.shift();
       consoleLogs.push({
         level: entry.level === "error" ? "error" : entry.level === "warning" ? "warning" : "info",
         text: entry.text || "",
@@ -6673,6 +7608,7 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
         error: "error", warn: "warning", warning: "warning",
         info: "info", log: "info", debug: "debug",
       };
+      if (consoleLogs.length >= SESSION_CONSOLE_CAP) consoleLogs.shift();
       consoleLogs.push({
         level: levelMap[type] || "info",
         text: args?.map((a: any) => a.value ?? a.description ?? "").join(" ") || "",
@@ -6750,6 +7686,10 @@ chrome.debugger.onEvent.addListener(async (source, method, params: any) => {
 // H4: Cleanup on debugger detach with reason tracking
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId === debuggerAttachedTabId) {
+    // Stop recording BEFORE clearing state — recording needs networkEntries/consoleLogs for finalization
+    if (activeRecording && activeRecording.tabId === source.tabId) {
+      autoStopRecording("tab_disconnected");
+    }
     // Clean up frame data and intercept rules for this tab
     frameTrees.delete(source.tabId!);
     frameContexts.delete(source.tabId!);
@@ -6806,6 +7746,11 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   // Skip non-HTTP and internal URLs
   if (!url || SKIP_URL_PREFIXES.some(p => url.startsWith(p))) return;
 
+  // Auto-probe on page load if no bridge connected
+  if (wsBridges.size === 0 && !userDisconnected) {
+    discoverAndConnectAll().catch(() => {});
+  }
+
   // Recording: detect page transition + re-inject indicators/capture
   if (activeRecording && activeRecording.tabId === tabId
       && url && url !== activeRecording.currentPageUrl) {
@@ -6825,8 +7770,8 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     }
   }
 
-  // Clear IDB on navigation for the connected tab — stale data from previous page
-  if (debuggerAttachedTabId === tabId) {
+  // Clear IDB on navigation only when actively capturing — avoids wiping data for idle connections
+  if (debuggerAttachedTabId === tabId && networkCapturing) {
     clearAll().catch(() => setTimeout(() => clearAll().catch(() => {}), 500));
   }
 
@@ -6989,6 +7934,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         browserContexts.clear();
         try { await clearAll(); } catch { /* IDB clear failed */ }
         resetIcon(conn.tabId);
+        clearBadge(conn.tabId);
+        setTooltip(conn.tabId, "Crawlio");
       }
       await chrome.storage.session.remove("crawlio:connectedTab");
       writeStatus({ capturing: false, activeTabId: null });
@@ -7112,6 +8059,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         browserContexts.clear();
         try { await clearAll(); } catch { /* IDB clear failed */ }
         resetIcon(tabId);
+        clearBadge(tabId);
+        setTooltip(tabId, "Crawlio");
       }
 
       await chrome.storage.session.remove("crawlio:connectedTab");
@@ -7170,6 +8119,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     return;
   }
   discoverAndConnectAll().catch(() => {});
+});
+
+// Auto-connect on browser startup (Chrome profile opened)
+chrome.runtime.onStartup.addListener(() => {
+  if (!userDisconnected) {
+    discoverAndConnectAll().catch(() => {});
+  }
 });
 
 // Start connection (probe-first, no ERR_CONNECTION_REFUSED)
@@ -7310,5 +8266,76 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   if (data["crawlio:connectedTab"]?.tabId === tabId) {
     await chrome.storage.session.remove("crawlio:connectedTab");
     writeStatus({ capturing: false, activeTabId: null });
+  }
+});
+
+// --- Keyboard shortcuts (Phase 2: SEO intelligence) ---
+chrome.commands.onCommand.addListener(async (command) => {
+  try {
+    switch (command) {
+      case "connect-tab": {
+        const tab = await getActiveTab();
+        if (!tab.id || !tab.url?.startsWith("http")) return;
+        if (debuggerAttachedTabId === tab.id) return; // already connected
+        await chrome.storage.session.set({ "crawlio:connectedTab": {
+          tabId: tab.id, url: tab.url || "", title: tab.title || "Untitled",
+          favIconUrl: tab.favIconUrl, windowId: tab.windowId,
+        }});
+        await startNetworkCapture(tab.id);
+        await persistState();
+        setDynamicIcon("active", tab.id);
+        if (__DEV__) console.log(`[Crawlio] Keyboard shortcut: connected to tab ${tab.id}`);
+        break;
+      }
+      case "capture-page": {
+        if (!debuggerAttachedTabId) return;
+        const screenshot = await takeScreenshotHardened(debuggerAttachedTabId);
+        if (screenshot) {
+          await chrome.storage.session.set({ "crawlio:keyboard-screenshot": { data: screenshot, capturedAt: new Date().toISOString() } });
+        }
+        if (__DEV__) console.log("[Crawlio] Keyboard shortcut: capture triggered");
+        break;
+      }
+      case "take-screenshot": {
+        if (!debuggerAttachedTabId) return;
+        const data = await takeScreenshotHardened(debuggerAttachedTabId);
+        if (data && __DEV__) console.log("[Crawlio] Keyboard shortcut: screenshot captured");
+        break;
+      }
+      case "toggle-recording": {
+        if (activeRecording) {
+          stopRecordingInternal("manual");
+          if (__DEV__) console.log("[Crawlio] Keyboard shortcut: recording stopped");
+        } else if (__DEV__) {
+          console.log("[Crawlio] Keyboard shortcut: use MCP start_recording to begin recording");
+        }
+        break;
+      }
+    }
+  } catch (err) {
+    if (__DEV__) console.warn(`[Crawlio] Keyboard shortcut "${command}" failed:`, err);
+  }
+});
+
+// --- Tab switch: restore active icon + auto-probe ---
+chrome.tabs.onActivated.addListener(async (activeInfo) => {
+  // Auto-probe on tab switch if no bridge connected
+  if (wsBridges.size === 0 && !userDisconnected) {
+    discoverAndConnectAll().catch(() => {});
+  }
+
+  try {
+    const tab = await chrome.tabs.get(activeInfo.tabId);
+    if (!tab.url) return;
+
+    // Recording badge takes priority
+    if (activeRecording && activeRecording.tabId === activeInfo.tabId) return;
+
+    // Debugger-attached tab: show active icon state
+    if (debuggerAttachedTabId === activeInfo.tabId) {
+      setDynamicIcon("active", activeInfo.tabId);
+    }
+  } catch {
+    // Tab may not exist
   }
 });

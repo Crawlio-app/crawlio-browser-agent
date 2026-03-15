@@ -61,8 +61,9 @@ async function fetchWithRetry(
 
       const retryAfter = response.headers.get("Retry-After");
       const backoff = config.baseDelay * Math.pow(2, attempt);
-      const delay = retryAfter
-        ? Math.min(Math.max(parseInt(retryAfter, 10) * 1000, backoff), config.maxDelay)
+      const parsed = retryAfter ? parseInt(retryAfter, 10) : NaN;
+      const delay = !isNaN(parsed)
+        ? Math.min(Math.max(parsed * 1000, backoff), config.maxDelay)
         : Math.min(backoff, config.maxDelay);
 
       await new Promise(r => setTimeout(r, delay));

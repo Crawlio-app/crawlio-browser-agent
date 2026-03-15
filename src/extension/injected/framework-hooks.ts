@@ -3,8 +3,8 @@
 // Must remain a self-contained string (no imports, no closures)
 export const FRAMEWORK_HOOK_SCRIPT = `(function() {
   if (window.__CRAWLIO_HOOKS_INSTALLED__) return;
-  window.__CRAWLIO_HOOKS_INSTALLED__ = true;
-  window.__CRAWLIO_FRAMEWORK_DATA__ = {};
+  Object.defineProperty(window, '__CRAWLIO_HOOKS_INSTALLED__', { value: true, enumerable: false, configurable: true });
+  Object.defineProperty(window, '__CRAWLIO_FRAMEWORK_DATA__', { value: {}, enumerable: false, configurable: true, writable: true });
 
   // React: install hook before React loads
   if (!window.__REACT_DEVTOOLS_GLOBAL_HOOK__) {
@@ -37,6 +37,7 @@ export const FRAMEWORK_HOOK_SCRIPT = `(function() {
           appCount: vueHook.apps.length + 1,
         };
       }
+      if (vueHook._buffer.length >= 100) vueHook._buffer.shift();
       vueHook._buffer.push({ event: event, args: Array.prototype.slice.call(arguments, 1) });
     };
     vueHook.on = function() {};

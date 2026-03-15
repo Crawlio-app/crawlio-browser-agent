@@ -2,7 +2,7 @@ import type { RecordingSession, RecordingInteraction, RecordingPage } from "../s
 
 // --- Public API ---
 
-export interface CompileOptions {
+interface CompileOptions {
   name: string;
   description?: string;
 }
@@ -42,7 +42,7 @@ export function compileRecording(session: RecordingSession, options: CompileOpti
   lines.push("Connect to a browser tab before running:");
   lines.push("");
   lines.push("```");
-  lines.push(`connect_tab({ url: "${escapeString(session.metadata.initialUrl)}" })`);
+  lines.push(`connect_tab({ url: ${JSON.stringify(session.metadata.initialUrl)} })`);
   lines.push("```");
   lines.push("");
 
@@ -206,7 +206,7 @@ function compileInteraction(interaction: RecordingInteraction): string {
     }
 
     default:
-      return `// Unknown tool: ${tool}`;
+      return `// Unknown tool: ${tool.replace(/[\r\n]/g, " ").slice(0, 100)}`;
   }
 }
 
@@ -226,6 +226,3 @@ export function sanitizeSkillName(raw: string): string {
   return name;
 }
 
-function escapeString(s: string): string {
-  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}

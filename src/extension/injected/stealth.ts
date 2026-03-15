@@ -1,8 +1,9 @@
 // Anti-detection stealth script — injected via Page.addScriptToEvaluateOnNewDocument + Runtime.evaluate
 // Must remain a self-contained string (no imports, no closures)
 export const STEALTH_SCRIPT = `(() => {
-  if (window.__crawlioStealth) return;
-  window.__crawlioStealth = true;
+  var _csKey = Symbol.for('crawlio:stealth');
+  if (window[_csKey]) return;
+  Object.defineProperty(window, _csKey, { value: true, enumerable: false, configurable: true });
   Object.defineProperty(navigator, 'webdriver', {
     get: () => false,
     configurable: true,
@@ -17,6 +18,7 @@ export const STEALTH_SCRIPT = `(() => {
       plugins.item = (i) => plugins[i] || null;
       plugins.namedItem = (name) => plugins.find(p => p.name === name) || null;
       plugins.refresh = () => {};
+      try { Object.setPrototypeOf(plugins, PluginArray.prototype); } catch(e) {}
       return plugins;
     },
     configurable: true,

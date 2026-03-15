@@ -9,7 +9,7 @@ export interface DeviceProfile {
   userAgent: string;
 }
 
-// Profiles sourced from Playwright's deviceDescriptorsSource.json + standard desktop resolutions
+// Profiles sourced from Chrome DevTools device catalog + standard desktop resolutions
 export const DEVICE_PROFILES: Record<string, DeviceProfile> = {
   "iPhone 14": {
     name: "iPhone 14",

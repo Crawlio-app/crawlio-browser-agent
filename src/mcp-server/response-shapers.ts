@@ -12,7 +12,7 @@ export function truncateUrl(url: string, max = 120): string {
 
 // --- list_tabs ---
 
-export interface TabEntry {
+interface TabEntry {
   tabId: number;
   url: string;
   title: string;
@@ -151,13 +151,15 @@ export function shapeCapturePage(data: PageCapture): unknown {
 export function shapeConsoleLogs(entries: ConsoleEntry[]): unknown {
   const errors = entries.filter(e => e.level === "error");
   const warnings = entries.filter(e => e.level === "warning");
+  const cappedErrors = errors.slice(0, 50).map(e => ({
+    text: e.text.slice(0, 300),
+    url: e.url ? truncateUrl(e.url, 80) : null,
+    lineNumber: e.lineNumber,
+  }));
   return {
     total: entries.length,
-    errors: errors.map(e => ({
-      text: e.text.slice(0, 300),
-      url: e.url ? truncateUrl(e.url, 80) : undefined,
-      lineNumber: e.lineNumber,
-    })),
+    errors: cappedErrors,
+    ...(errors.length > 50 ? { totalErrors: errors.length, errorsTruncated: true } : {}),
     warnings: warnings.slice(0, 10).map(e => ({
       text: e.text.slice(0, 200),
     })),
@@ -190,13 +192,15 @@ export function shapeNetworkLog(entries: NetworkEntry[]): unknown {
       status: e.status,
     }));
 
+  const cappedFailed = failed.slice(0, 20).map(e => ({
+    url: truncateUrl(e.url, 80),
+    status: e.status,
+    method: e.method,
+  }));
   return {
     total: entries.length,
-    failed: failed.map(e => ({
-      url: truncateUrl(e.url, 80),
-      status: e.status,
-      method: e.method,
-    })),
+    failed: cappedFailed,
+    ...(failed.length > 20 ? { totalFailed: failed.length, failedTruncated: true } : {}),
     byStatus,
     byType,
     slowest,

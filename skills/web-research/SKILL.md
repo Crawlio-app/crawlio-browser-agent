@@ -29,7 +29,7 @@ await connect_tab({ url: "https://example.com" })
 
 // Extract everything in one call
 const page = await smart.extractPage()
-// Returns: { capture, performance, security, fonts, meta }
+// Returns: { capture, performance, security, fonts, meta, accessibility, mobileReadiness, gaps }
 ```
 
 For visual evidence, add `smart.scrollCapture()`:
@@ -63,12 +63,34 @@ const record = {
   security: page.security,             // TLS, cert, mixed content
   fonts: page.fonts,                   // declared + computed
   meta: page.meta,                     // OG tags, structured data, headings, nav links
+  accessibility: page.accessibility,   // node count, landmarks, images without alt, heading structure
+  mobileReadiness: page.mobileReadiness, // viewport meta, media queries, overflow
+  gaps: page.gaps,                     // what data failed — check before trusting null fields
 }
 ```
 
 ### Phase 3: Analyze
 
-Compare against a fixed rubric. Produce structured findings, not prose.
+Compare against a fixed rubric. Produce validated findings using `smart.finding()`:
+
+```js
+smart.finding({
+  claim: "Site loads 47 network requests with 2 failures",
+  evidence: ["network.total: 47", "network.failed: 2"],
+  sourceUrl: page.capture.url,
+  confidence: "high",
+  method: "extractPage",
+  dimension: "performance"  // auto-caps confidence if perf data had gaps
+})
+
+// Retrieve all findings from this session
+const allFindings = smart.findings()
+
+// Reset for next research task
+smart.clearFindings()
+```
+
+If `extractPage()` reported gaps (e.g., performance metrics failed), findings with matching `dimension` get confidence automatically capped one level (high → medium, medium → low). Check `page.gaps` to understand what data is missing.
 
 ## Use Existing Tools — Not Manual Equivalents
 
@@ -128,9 +150,12 @@ When comparing sites, evaluate these dimensions:
 
 ### Prefer:
 
-- **One `extractPage()` per page** — it runs capture_page + perf + security + fonts + meta in parallel
-- **`comparePages()` for 2-site comparisons** — handles navigation + extraction for both sites
-- **Structured findings** — each with URL, extracted data, and confidence level
+- **One `extractPage()` per page** — it runs 7 ops in parallel (capture + perf + security + fonts + meta + accessibility + mobile-readiness) with typed gaps
+- **`comparePages()` for 2-site comparisons** — returns `{ siteA, siteB, scaffold }` with 11 fixed comparison dimensions
+- **`smart.finding()` for validated findings** — enforces claim + evidence + sourceUrl + confidence + method schema
+- **No `smart.screenshot()`** — it doesn't exist. Use `bridge.send({ type: 'take_screenshot' })` or `smart.scrollCapture()`
+- **No `smart.snapshot({ compact: true })`** — compact option doesn't exist. Use `smart.snapshot()` or `{ interactive: true }`
+- **No `location.href = "..."` for navigation** — use `smart.navigate(url)`. Direct assignment breaks CDP
 
 ## Example: Competitive Audit
 

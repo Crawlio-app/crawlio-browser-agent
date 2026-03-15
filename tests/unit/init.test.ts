@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { parseFlags, buildStdioEntry, buildPortalEntry, buildCloudflareEntry, isAlreadyConfigured, isCloudflareConfigured, findMcpConfig, findConflictingConfigs, extractSkillName, createAppWrapper, CLIENT_REGISTRY, configureClient, configureAllClients } from "@/mcp-server/init";
 import type { McpClientDef } from "@/mcp-server/init";
 import { PKG_VERSION } from "@/shared/constants";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "fs";
 import { platform } from "os";
 import { resolve } from "path";
 
@@ -14,6 +14,7 @@ vi.mock("fs", async () => {
     readFileSync: vi.fn(),
     writeFileSync: vi.fn(),
     mkdirSync: vi.fn(),
+    renameSync: vi.fn(),
   };
 });
 

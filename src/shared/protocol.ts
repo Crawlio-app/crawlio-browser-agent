@@ -114,7 +114,7 @@ export type ServerCommand =
   | { type: "switch_tab"; id: string; tabId: number }
   // Network intercept (AC-7)
   | { type: "browser_intercept"; id: string; [key: string]: unknown }
-  // Network replay (PiecesOS Heist Ph3)
+  // Network replay
   | { type: "replay_request"; id: string; [key: string]: unknown }
   // Crawlio server commands
   | { type: "extract_site"; id: string; [key: string]: unknown }
@@ -128,14 +128,28 @@ export type ServerCommand =
   | { type: "browser_evaluate"; id: string; expression: string }
   // Batch form fill (via refs from browser_snapshot)
   | { type: "browser_fill_form"; id: string; fields: Array<{ ref: string; type?: string; value: string }> }
-  // Accessibility snapshot (via CDP Accessibility.getFullAXTree)
-  | { type: "browser_snapshot"; id: string }
+  // Accessibility snapshot (via CDP Accessibility.getFullAXTree, with optional filtering)
+  | { type: "browser_snapshot"; id: string; interactive?: boolean; compact?: boolean; maxDepth?: number; selector?: string }
   // Session recording
   | { type: "start_recording"; id: string; maxDurationSec?: number; maxInteractions?: number }
   | { type: "stop_recording"; id: string }
   | { type: "get_recording_status"; id: string }
   // Network idle detection
-  | { type: "wait_for_network_idle"; id: string; timeout?: number; idleTime?: number };
+  | { type: "wait_for_network_idle"; id: string; timeout?: number; idleTime?: number }
+  // Tracking pixel parser
+  | { type: "parse_tracking_pixels"; id: string }
+  // DataLayer inspection (CDP Runtime.evaluate — probes fbq, dataLayer, GTM, ttq state)
+  | { type: "inspect_datalayer"; id: string }
+  // Snapshot diffing
+  | { type: "diff_snapshot"; id: string; baseline?: string }
+  // CDP SERP overlay (Phase 3)
+  | { type: "inject_serp_overlay"; id: string; widgets: string[]; query: string; data: Record<string, unknown> }
+  | { type: "clear_serp_overlay"; id: string }
+  // Raw vs Rendered comparison (Phase 5)
+  | { type: "compare_raw_rendered"; id: string }
+  // SEO Intelligence settings (Phase 6)
+  | { type: "set_seo_intelligence"; id: string; [key: string]: unknown }
+  | { type: "get_seo_intelligence"; id: string };
 
 export type ExtensionResponse =
   | { type: "response"; id: string; success: true; data: unknown }

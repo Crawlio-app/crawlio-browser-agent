@@ -2,7 +2,7 @@ import { homedir } from "os";
 import { join } from "path";
 
 // Single source of truth — bump here, tests enforce sync with package.json
-export const PKG_VERSION = "1.5.9";
+export const PKG_VERSION = "1.6.4";
 
 export const WS_PORT = 9333;
 export const WS_PORT_MAX = 9342;    // end of port range (inclusive) — 10 slots

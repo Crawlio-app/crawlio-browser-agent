@@ -10,14 +10,28 @@ import type { WebSocketBridge } from "./websocket-bridge.js";
 import type { CrawlioClient } from "./crawlio-client.js";
 import { TIMEOUTS } from "../shared/constants.js";
 import type { PageCapture, FrameworkDetection, NetworkEntry, ConsoleEntry, InteractionResult, CookieEntry, RecordingSession } from "../shared/types.js";
-import type { PageEvidence, ScrollEvidence, IdleStatus, ComparisonEvidence, Finding, CoverageGap, Observation, DimensionSlot, ComparableMetric, ComparisonScaffold, MethodTrace, StepTrace, ConfidenceLevel, AccessibilitySummary, MobileReadiness, TableCandidate, TableExtraction, NetworkIdleResult, DataExtraction } from "../shared/evidence-types.js";
+import type { PageEvidence, ScrollEvidence, IdleStatus, ComparisonEvidence, Finding, CoverageGap, Observation, DimensionSlot, ComparableMetric, ComparisonScaffold, MethodTrace, StepTrace, ConfidenceLevel, AccessibilitySummary, MobileReadiness, TableCandidate, TableExtraction, NetworkIdleResult, DataExtraction, TrackingParseResult, TrackingValidationResult, SnapshotDiffResult, DataLayerState, DuplicateCluster } from "../shared/evidence-types.js";
 import { shapeListTabs, shapeConnectTab, shapeCapturePage, shapeConsoleLogs, shapeNetworkLog, shapeCookies, shapeInteraction } from "./response-shapers.js";
 import { compileRecording, sanitizeSkillName } from "./recording-compiler.js";
 import { loadEmbeddings, buildQueryEmbedding, semanticSearch, normalizeScores } from "./semantic-search.js";
+import { parseTrackingPixels, detectDuplicates } from "./tracking-parser.js";
+import { validateTrackingEvents } from "./tracking-validator.js";
+import { diffSnapshots as computeDiff } from "./snapshot-diff.js";
+import { matchFingerprints, buildTechnographicResult } from "./fingerprint-db.js";
+import { collectSignals, buildJSGlobalsCheckExpr, META_TAG_EXTRACTION_EXPR } from "../extension/sensors/tech-signal-collector.js";
+import type { TechnographicResult, CapturedSignals } from "../shared/evidence-types.js";
+import type { SeoAuditResult, RawRenderedComparison, CruxMetrics } from "../shared/seo-types.js";
+import { fetchCruxMetrics } from "./crux-client.js";
 
 const execFileAsync = promisify(execFile);
 
 type BridgeCommand = Parameters<WebSocketBridge["send"]>[0];
+
+/** Typed bridge response for list_tabs — replaces `as any` cast */
+interface BridgeTabsResponse {
+  tabs: Array<{ tabId: number; url: string; title: string; windowId?: number; active?: boolean; connected?: boolean; [key: string]: unknown }>;
+  connectedTabId?: number | null;
+}
 
 // --- Validation schemas ---
 
@@ -211,12 +225,38 @@ export const TOOL_TIMEOUTS: Record<string, number> = {
   detect_tables: 15000,
   extract_table: 15000,
   extract_data: 30000,
+  parse_tracking_pixels: 10000,
+  validate_tracking: 10000,
+  inspect_datalayer: 10000,
+  detect_technologies: 20000,
+  diff_snapshot: 15000,
+  inject_serp_overlay: 15000,
+  clear_serp_overlay: 10000,
+  seo_audit: 20000,
+  check_robots_txt: 15000,
+  check_sitemap: 15000,
+  compare_raw_rendered: 30000,
+  set_seo_intelligence: 5000,
+  get_seo_intelligence: 5000,
+  crux_metrics: 15000,
 };
 
 // --- Structured response helpers ---
 
+/** JSON.stringify with circular reference protection (WeakSet-based) */
+function safeStringify(value: unknown): string {
+  const seen = new WeakSet();
+  return JSON.stringify(value ?? {}, (_key, val) => {
+    if (typeof val === "object" && val !== null) {
+      if (seen.has(val)) return "[Circular]";
+      seen.add(val);
+    }
+    return val;
+  });
+}
+
 export function toolSuccess(content: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(content ?? {}) }], isError: false };
+  return { content: [{ type: "text" as const, text: safeStringify(content) }], isError: false };
 }
 
 export function toolError(message: string) {
@@ -231,11 +271,44 @@ export const ACTIONABILITY_BACKOFF = [0, 20, 100, 100, 500];
 /** Cache for buildSmartObject — keyed by page URL to avoid redundant detect_framework calls */
 let smartObjectCache: { url: string; smart: Record<string, unknown> } | null = null;
 
-/** Module-level findings accumulator — persists across smart object rebuilds within a session */
+/**
+ * Module-level findings accumulator — persists across smart object rebuilds within a session.
+ * LIMITATION: stdio-only. In portal mode (multiple MCP clients per process), findings from
+ * one session bleed into another. Portal mode needs per-transport scoping via a session map.
+ */
 let sessionFindings: Finding[] = [];
 
-/** Module-level coverage gaps — merged from extractPage calls within a session */
+/**
+ * Module-level coverage gaps — merged from extractPage calls within a session.
+ * Same stdio-only limitation as sessionFindings above.
+ */
 let sessionGaps: CoverageGap[] = [];
+
+/** Summarize a raw DOM snapshot into stats (nodeCount, elementCount, textLength, depth) */
+function summarizeDomSnapshot(data: Record<string, unknown>): { nodeCount: number; elementCount: number; textLength: number; depth: number } {
+  let nodeCount = 0;
+  let elementCount = 0;
+  let textLength = 0;
+  let maxDepth = 0;
+  function walk(node: Record<string, unknown>, depth: number) {
+    nodeCount++;
+    if (depth > maxDepth) maxDepth = depth;
+    if (typeof node.tag === "string") elementCount++;
+    if (typeof node.text === "string") textLength += (node.text as string).length;
+    const children = node.children as Array<Record<string, unknown>> | undefined;
+    if (Array.isArray(children)) {
+      for (const child of children) walk(child, depth + 1);
+    }
+  }
+  if (typeof data === "object" && data !== null) {
+    if (Array.isArray(data.children)) {
+      walk(data as Record<string, unknown>, 0);
+    } else if (typeof data.tag === "string") {
+      walk(data, 0);
+    }
+  }
+  return { nodeCount, elementCount, textLength, depth: maxDepth };
+}
 
 /** Summarize a raw accessibility tree into an AccessibilitySummary */
 function summarizeAccessibility(raw: Record<string, unknown>): AccessibilitySummary {
@@ -422,8 +495,8 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       description: "List all open HTTP/HTTPS browser tabs with their IDs, URLs, titles, and which tab is currently connected. Use this to discover tab IDs for connect_tab.",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
-        const data = await bridge.send({ type: "list_tabs" }, TOOL_TIMEOUTS.list_tabs);
-        return toolSuccess(shapeListTabs(data as any));
+        const data = await bridge.send({ type: "list_tabs" }, TOOL_TIMEOUTS.list_tabs) as BridgeTabsResponse;
+        return toolSuccess(shapeListTabs(data));
       },
     },
     {
@@ -467,6 +540,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         const schema = z.object({ sendToCrawlio: z.boolean().optional() });
         const parsed = schema.parse(args);
         const data = await bridge.send({ type: "capture_page" }, TOOL_TIMEOUTS.capture_page) as PageCapture;
+        if (!data || typeof data.url !== "string") throw new Error("Bridge returned invalid capture_page response (missing url)");
         if (parsed.sendToCrawlio !== false) {
           try {
             await crawlio.postEnrichment(data.url, {
@@ -506,6 +580,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         const data = await bridge.send({ type: "stop_network_capture" }, TOOL_TIMEOUTS.stop_network_capture) as NetworkEntry[];
+        if (!Array.isArray(data)) throw new Error("Bridge returned invalid stop_network_capture response (expected array)");
         return toolSuccess(shapeNetworkLog(data));
       },
     },
@@ -515,6 +590,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         const data = await bridge.send({ type: "get_console_logs" }, TOOL_TIMEOUTS.get_console_logs) as ConsoleEntry[];
+        if (!Array.isArray(data)) throw new Error("Bridge returned invalid get_console_logs response (expected array)");
         return toolSuccess(shapeConsoleLogs(data));
       },
     },
@@ -525,6 +601,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       handler: async () => {
         try {
           const data = await bridge.send({ type: "get_cookies" }, TOOL_TIMEOUTS.get_cookies) as { cookies: CookieEntry[]; fallbackUsed: boolean };
+          if (!data || !Array.isArray(data.cookies)) throw new Error("Bridge returned invalid get_cookies response (missing cookies array)");
           return toolSuccess(shapeCookies(data));
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
@@ -534,17 +611,24 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     },
     {
       name: "get_dom_snapshot",
-      description: "Get a simplified DOM snapshot of the active tab (strips script/style/svg, captures tag/attrs/text/children).",
+      description: "Get a simplified DOM snapshot of the active tab (strips script/style/svg, captures tag/attrs/text/children). Returns stats summary by default; set summarize=false for full tree.",
       inputSchema: {
         type: "object",
         properties: {
           maxDepth: { type: "number", description: "Maximum depth of DOM tree to capture (default: 10)" },
+          summarize: { type: "boolean", description: "Return stats summary instead of raw tree (default: true)" },
         },
       },
       handler: async (args) => {
-        const schema = z.object({ maxDepth: z.number().int().min(1).max(50).default(10) });
+        const schema = z.object({
+          maxDepth: z.number().int().min(1).max(50).default(10),
+          summarize: z.boolean().default(true),
+        });
         const parsed = schema.parse(args);
-        const data = await bridge.send({ type: "get_dom_snapshot", maxDepth: parsed.maxDepth }, TOOL_TIMEOUTS.get_dom_snapshot);
+        const data = await bridge.send({ type: "get_dom_snapshot", maxDepth: parsed.maxDepth }, TOOL_TIMEOUTS.get_dom_snapshot) as Record<string, unknown>;
+        if (parsed.summarize) {
+          return toolSuccess(summarizeDomSnapshot(data));
+        }
         return toolSuccess(data);
       },
     },
@@ -554,6 +638,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         const data = await bridge.send({ type: "take_screenshot" }, TOOL_TIMEOUTS.take_screenshot) as { data: string };
+        if (!data || typeof data.data !== "string") throw new Error("Bridge returned invalid take_screenshot response (missing data)");
         return { content: [{ type: "image" as const, data: data.data, mimeType: "image/png" }], isError: false };
       },
     },
@@ -996,14 +1081,65 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     // --- CV-5: ARIA Snapshot tool ---
     {
       name: "browser_snapshot",
-      description: "Capture accessibility snapshot of the current page. Returns a compact ARIA tree with ref strings (e.g., [ref=e1]) for interactive elements. Use refs with browser_click, browser_type, browser_hover to target elements without constructing CSS selectors. Refs are valid until the page navigates or significant DOM changes occur — call browser_snapshot again after navigation.",
+      description: "Capture accessibility snapshot of the current page. Returns a compact ARIA tree with ref strings (e.g., [ref=e1]) for interactive elements. Use refs with browser_click, browser_type, browser_hover to target elements without constructing CSS selectors. Refs are valid until the page navigates or significant DOM changes occur — call browser_snapshot again after navigation. Options: interactive=true for 60-80% token reduction (interactive elements only), compact=true to remove empty structural branches, maxDepth to limit tree depth, selector to scope to a CSS subtree.",
       inputSchema: {
         type: "object",
-        properties: {},
+        properties: {
+          interactive: { type: "boolean", description: "Interactive-only mode: show only buttons, links, inputs, etc. 60-80% token reduction." },
+          compact: { type: "boolean", description: "Remove structural elements with no interactive descendants." },
+          maxDepth: { type: "number", description: "Maximum tree depth (0 = root only, default: unlimited)." },
+          selector: { type: "string", description: "CSS selector to scope snapshot to a subtree (e.g., '#main', '.content')." },
+        },
       },
-      handler: async () => {
-        const data = await bridge.send({ type: "browser_snapshot" }, TOOL_TIMEOUTS.browser_snapshot);
+      handler: async (args) => {
+        const schema = z.object({
+          interactive: z.boolean().optional(),
+          compact: z.boolean().optional(),
+          maxDepth: z.number().int().min(0).max(50).optional(),
+          selector: z.string().max(500).optional(),
+        });
+        const parsed = schema.parse(args);
+        const data = await bridge.send({
+          type: "browser_snapshot",
+          ...(parsed.interactive !== undefined && { interactive: parsed.interactive }),
+          ...(parsed.compact !== undefined && { compact: parsed.compact }),
+          ...(parsed.maxDepth !== undefined && { maxDepth: parsed.maxDepth }),
+          ...(parsed.selector !== undefined && { selector: parsed.selector }),
+        }, TOOL_TIMEOUTS.browser_snapshot);
         return toolSuccess(data);
+      },
+    },
+    // --- Snapshot diffing tool ---
+    {
+      name: "diff_snapshot",
+      description: "Compare the current ARIA snapshot against a previous one using Myers line-level diff. Returns a unified diff with addition/removal stats. If no baseline is provided, diffs against the last cached snapshot (from the most recent browser_snapshot call). Use this to verify interaction effects — click a button, then diff to see what changed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          baseline: { type: "string", description: "Previous snapshot text to diff against. If omitted, uses the last cached snapshot." },
+          selector: { type: "string", description: "CSS selector to scope the current snapshot to a subtree." },
+          compact: { type: "boolean", description: "Remove structural elements with no interactive descendants from current snapshot." },
+        },
+      },
+      handler: async (args) => {
+        const schema = z.object({
+          baseline: z.string().optional(),
+          selector: z.string().max(500).optional(),
+          compact: z.boolean().optional(),
+        });
+        const parsed = schema.parse(args);
+
+        // Get baseline + current from the extension
+        const extensionResult = await bridge.send({
+          type: "diff_snapshot",
+          ...(parsed.baseline !== undefined && { baseline: parsed.baseline }),
+        }, TOOL_TIMEOUTS.browser_snapshot);
+
+        const { baseline, current } = extensionResult as { baseline: string; current: string };
+
+        // Compute diff on the MCP server side
+        const result = computeDiff(baseline, current);
+        return toolSuccess(result);
       },
     },
     // --- Element waiting tool (AC-1) ---
@@ -1778,7 +1914,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
     },
     {
       name: "set_stealth_mode",
-      description: "Enable or disable anti-detection stealth mode. When enabled, patches navigator.webdriver, plugins, WebGL renderer, and other automation signals to avoid bot detection. Enabled by default on connect.",
+      description: "Enable or disable anti-detection stealth mode. When enabled, patches navigator.webdriver, plugins, WebGL renderer, and other automation signals to avoid bot detection. Disabled by default. Call with enabled: true to activate.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1967,6 +2103,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         properties: {
           selector: { type: "string", description: "CSS selector of the element to replace" },
           html: { type: "string", description: "New outer HTML to set" },
+          dangerous: { type: "boolean", description: "Set to true to allow HTML containing <script>, <iframe>, or event handlers" },
         },
         required: ["selector", "html"],
       },
@@ -1974,11 +2111,13 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         const parsed = z.object({
           selector: selectorSchema,
           html: z.string().min(1).max(1_000_000),
+          dangerous: z.boolean().optional(),
         }).parse(args);
         const data = await bridge.send({
           type: "set_outer_html",
           selector: parsed.selector,
           html: parsed.html,
+          dangerous: parsed.dangerous,
         }, TOOL_TIMEOUTS.set_outer_html);
         return toolSuccess(data);
       },
@@ -2629,7 +2768,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
           const execErr = e as { stderr?: string };
           if (execErr?.stderr) {
             try {
-              const parsed = JSON.parse(execErr.stderr!.trim());
+              const parsed = JSON.parse(execErr.stderr?.trim() ?? "");
               if (parsed.error) return toolError(`OCR failed: ${parsed.error}`);
             } catch { /* not JSON, fall through */ }
           }
@@ -2756,7 +2895,7 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
       },
       handler: async (args: Record<string, unknown>) => {
         const schema = z.object({
-          selector: z.string().min(1),
+          selector: selectorSchema,
           maxRows: z.number().int().min(1).max(1000).default(200),
         });
         const parsed = schema.parse(args);
@@ -3058,6 +3197,671 @@ export function createTools(bridge: WebSocketBridge, crawlio: CrawlioClient): To
         });
       },
     },
+    // --- Detection Wedge: Tracking Pixel Parser ---
+    {
+      name: "parse_tracking_pixels",
+      description: "Parse captured network requests to detect tracking pixel fires from Facebook, GA4, TikTok, LinkedIn, and Pinterest. Extracts pixel IDs, event names, parameters, and vendor classification from NetworkEntry data. Operates on already-captured network data — no additional page interaction required.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+      handler: async () => {
+        const data = await bridge.send({ type: "parse_tracking_pixels" }, TOOL_TIMEOUTS.parse_tracking_pixels) as TrackingParseResult;
+        return toolSuccess(data);
+      },
+    },
+    // --- Detection Wedge: Tracking Event Validation ---
+    {
+      name: "validate_tracking",
+      description: "Validate tracking pixel events against per-vendor parameter schemas. Checks for missing required/recommended parameters, invalid types, duplicate events, missing PageView, and possible event name typos. Uses parsed tracking data from parse_tracking_pixels. Returns issues with error/warning/info severity and actionable recommendations. Operates on already-captured network data.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+      handler: async () => {
+        const parseResult = await bridge.send({ type: "parse_tracking_pixels" }, TOOL_TIMEOUTS.validate_tracking) as TrackingParseResult;
+        const result = validateTrackingEvents(parseResult);
+        return toolSuccess(result);
+      },
+    },
+    // --- Detection Wedge: DataLayer Inspection ---
+    {
+      name: "inspect_datalayer",
+      description: "Inspect tracker runtime state via CDP Runtime.evaluate. Probes Facebook fbq (loaded, version, pixelIds, queue), GA4 dataLayer (events, gtag/ga presence), GTM containers (GTM-/G- IDs), and TikTok ttq (loaded, queue). Returns DataLayerState with null for absent trackers. Requires debugger attached — no content script needed.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+      handler: async () => {
+        const data = await bridge.send({ type: "inspect_datalayer" }, TOOL_TIMEOUTS.inspect_datalayer) as DataLayerState;
+        return toolSuccess(data);
+      },
+    },
+    // --- Detection Wedge: Technographic Fingerprint Detection ---
+    {
+      name: "detect_technologies",
+      description: "Detect technologies on the current page using CDP-captured signals matched against a curated fingerprint database (~200 technologies). Collects response headers, script URLs, JS globals, meta tags, cookies, and page URL — then runs additive confidence scoring (per-pattern weights summed, capped at 100). Returns technologies with numeric confidence, version, categories, and matched signals for full transparency. Requires debugger attached.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          confidenceThreshold: { type: "number", description: "Minimum confidence to include in results (default 1, range 0-100)" },
+        },
+      },
+      handler: async (args: Record<string, unknown>) => {
+        const schema = z.object({
+          confidenceThreshold: z.number().int().min(0).max(100).default(1),
+        });
+        const parsed = schema.parse(args);
+
+        // Run capture_page to get network entries, cookies, and framework data
+        const capture = await bridge.send({ type: "capture_page" }, TOOL_TIMEOUTS.detect_technologies) as PageCapture;
+        const pageUrl = capture?.url || "";
+
+        // Parallel: meta tags, JS globals, HTML snippet from page context
+        const [metaResult, jsResult, htmlResult] = await Promise.all([
+          bridge.send({ type: "browser_evaluate", expression: META_TAG_EXTRACTION_EXPR }, 5000).catch(() => ({ result: {} })),
+          bridge.send({ type: "browser_evaluate", expression: buildJSGlobalsCheckExpr() }, 5000).catch(() => ({ result: {} })),
+          bridge.send({ type: "browser_evaluate", expression: "document.documentElement.outerHTML.substring(0, 50000)" }, 5000).catch(() => ({ result: "" })),
+        ]) as [
+          { result: Record<string, string> },
+          { result: Record<string, string | null> },
+          { result: string },
+        ];
+
+        const signals = collectSignals({
+          networkEntries: capture.networkRequests || [],
+          cookies: capture.cookies || [],
+          metaTags: metaResult.result as Record<string, string>,
+          jsGlobals: jsResult.result as Record<string, string | null>,
+          url: pageUrl,
+          html: typeof htmlResult.result === "string" ? htmlResult.result : undefined,
+        });
+
+        const detections = matchFingerprints(signals);
+        const filtered = parsed.confidenceThreshold > 0
+          ? detections.filter(d => d.confidence >= parsed.confidenceThreshold)
+          : detections;
+        const result = buildTechnographicResult(filtered, signals, 50);
+        return toolSuccess(result);
+      },
+    },
+    // --- CDP SERP Overlay (Phase 3) ---
+    {
+      name: "inject_serp_overlay",
+      description: "Inject SEO overlay widgets into a Google SERP page using CDP + shadow DOM isolation. Requires debugger attached to a tab showing a Google search results page. Widgets: badge (per-result framework/perf), header (top bar with query info), sidebar (aggregated metrics panel). All rendering uses shadow DOM — no style conflicts with Google's page.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          widgets: {
+            type: "array",
+            items: { type: "string", enum: ["badge", "header", "sidebar"] },
+            description: "Widget types to inject (default: all three)",
+          },
+          data: {
+            type: "object",
+            description: "Per-hostname data for badges. Keys are hostnames, values are { framework?: string, perfScore?: number }",
+          },
+        },
+      },
+      handler: async (args: Record<string, unknown>) => {
+        const schema = z.object({
+          widgets: z.array(z.enum(["badge", "header", "sidebar"])).default(["badge", "header", "sidebar"]),
+          data: z.record(z.unknown()).optional(),
+        });
+        const parsed = schema.parse(args);
+
+        // Verify we're on a Google SERP
+        const status = await bridge.send({ type: "get_connection_status" }, 5000) as {
+          connectedTab?: { url?: string };
+        };
+        const url = status?.connectedTab?.url || "";
+        const serpMatch = /^https?:\/\/(?:www\.)?google\.[a-z.]+\/search\?/i.test(url);
+        if (!serpMatch) {
+          return toolError("Not on a Google SERP. Navigate to a Google search results page first.");
+        }
+
+        // Extract query from URL
+        let query = "";
+        try {
+          const params = new URL(url).searchParams;
+          query = params.get("q") || "";
+        } catch { /* no query */ }
+
+        const result = await bridge.send({
+          type: "inject_serp_overlay",
+          widgets: parsed.widgets,
+          query,
+          data: parsed.data || {},
+        }, TOOL_TIMEOUTS.inject_serp_overlay);
+
+        return toolSuccess(result);
+      },
+    },
+    {
+      name: "clear_serp_overlay",
+      description: "Remove all Crawlio SERP overlay widgets (badges, header bar, sidebar) from the current page. Safe to call even if no overlay is present.",
+      inputSchema: { type: "object", properties: {} },
+      handler: async () => {
+        const result = await bridge.send({
+          type: "clear_serp_overlay",
+        }, TOOL_TIMEOUTS.clear_serp_overlay);
+        return toolSuccess(result);
+      },
+    },
+    // --- On-Page SEO Analysis (Phase 4) ---
+    {
+      name: "seo_audit",
+      description: "Run a comprehensive on-page SEO audit on the connected page via CDP. Extracts 11 dimensions: meta tags, heading structure, link profile, images, structured data, Open Graph, Twitter Cards, canonical/hreflang, robots directives, content metrics, and technical signals. Returns a scored audit with actionable issues. Requires debugger attached.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sections: {
+            type: "array",
+            items: { type: "string", enum: ["meta", "headings", "links", "images", "structuredData", "openGraph", "twitterCard", "canonical", "robots", "content", "technical"] },
+            description: "Optional: only audit specific sections. Omit to run all 11.",
+          },
+        },
+      },
+      handler: async (args: Record<string, unknown>) => {
+        const schema = z.object({
+          sections: z.array(z.string()).optional(),
+        });
+        const parsed = schema.parse(args);
+        const sections = parsed.sections;
+
+        const result = await bridge.send({
+          type: "browser_evaluate",
+          expression: `(() => {
+  const url = location.href;
+  const auditedAt = new Date().toISOString();
+  const sections = ${JSON.stringify(sections || null)};
+  const shouldRun = (s) => !sections || sections.includes(s);
+
+  // --- Meta Tags ---
+  function auditMeta() {
+    const title = document.title || null;
+    const descEl = document.querySelector('meta[name="description"]');
+    const description = descEl ? descEl.getAttribute("content") : null;
+    const robotsEl = document.querySelector('meta[name="robots"]');
+    const robots = robotsEl ? robotsEl.getAttribute("content") : null;
+    const viewportEl = document.querySelector('meta[name="viewport"]');
+    const viewport = viewportEl ? viewportEl.getAttribute("content") : null;
+    const charsetEl = document.querySelector('meta[charset]') || document.querySelector('meta[http-equiv="Content-Type"]');
+    const charset = charsetEl ? (charsetEl.getAttribute("charset") || charsetEl.getAttribute("content")) : null;
+    const authorEl = document.querySelector('meta[name="author"]');
+    const author = authorEl ? authorEl.getAttribute("content") : null;
+    const genEl = document.querySelector('meta[name="generator"]');
+    const generator = genEl ? genEl.getAttribute("content") : null;
+    return {
+      title, titleLength: title ? title.length : 0,
+      description, descriptionLength: description ? description.length : 0,
+      robots, viewport, charset, author, generator
+    };
+  }
+
+  // --- Headings ---
+  function auditHeadings() {
+    const hierarchy = [];
+    let prevLevel = 0;
+    let valid = true;
+    const h1Texts = [];
+    const els = document.querySelectorAll("h1, h2, h3, h4, h5, h6");
+    for (const el of els) {
+      const lvl = parseInt(el.tagName.charAt(1), 10);
+      const text = (el.textContent || "").trim().slice(0, 200);
+      hierarchy.push({ level: lvl, text });
+      if (lvl === 1) h1Texts.push(text);
+      if (lvl > prevLevel + 1 && prevLevel > 0) valid = false;
+      prevLevel = lvl;
+    }
+    return {
+      h1Count: h1Texts.length,
+      h1Texts,
+      hierarchy,
+      hasValidHierarchy: valid,
+      totalHeadings: hierarchy.length
+    };
+  }
+
+  // --- Links ---
+  function auditLinks() {
+    const anchors = document.querySelectorAll("a[href]");
+    const pageHost = location.hostname;
+    const links = [];
+    let internal = 0, external = 0, nofollow = 0, ugc = 0, sponsored = 0, broken = 0, dofollow = 0;
+    const seen = new Set();
+    for (const a of anchors) {
+      const href = a.getAttribute("href") || "";
+      const rel = (a.getAttribute("rel") || "").toLowerCase();
+      const text = (a.textContent || "").trim().slice(0, 100);
+      let isExternal = false;
+      try {
+        const u = new URL(href, location.href);
+        isExternal = u.hostname !== pageHost;
+      } catch { isExternal = false; }
+      const isNofollow = rel.includes("nofollow");
+      if (isExternal) external++; else internal++;
+      if (isNofollow) nofollow++;
+      if (rel.includes("ugc")) ugc++;
+      if (rel.includes("sponsored")) sponsored++;
+      if (!isNofollow && !rel.includes("ugc") && !rel.includes("sponsored")) dofollow++;
+      if (!href || href === "#" || href === "javascript:void(0)") broken++;
+      if (!seen.has(href)) seen.add(href);
+      if (links.length < 200) links.push({ href, text, rel, isExternal, isNofollow });
+    }
+    return { total: anchors.length, internal, external, dofollow, nofollow, ugc, sponsored, broken, unique: seen.size, links };
+  }
+
+  // --- Images ---
+  function auditImages() {
+    const imgs = document.querySelectorAll("img");
+    const images = [];
+    let withAlt = 0, withoutAlt = 0, lazyLoaded = 0, withDimensions = 0;
+    for (const img of imgs) {
+      const alt = img.getAttribute("alt");
+      const src = img.getAttribute("src") || img.getAttribute("data-src") || "";
+      const loading = img.getAttribute("loading");
+      const w = img.naturalWidth || img.width || null;
+      const h = img.naturalHeight || img.height || null;
+      if (alt !== null && alt !== "") withAlt++; else withoutAlt++;
+      if (loading === "lazy" || img.getAttribute("data-src")) lazyLoaded++;
+      if (w && h) withDimensions++;
+      if (images.length < 100) images.push({ src: src.slice(0, 500), alt, width: w || null, height: h || null, loading });
+    }
+    return { total: imgs.length, withAlt, withoutAlt, lazyLoaded, withDimensions, images };
+  }
+
+  // --- Structured Data ---
+  function auditStructuredData() {
+    const jsonLd = [];
+    for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
+      try { jsonLd.push(JSON.parse(s.textContent || "")); } catch {}
+    }
+    const microdataCount = document.querySelectorAll("[itemscope]").length;
+    const rdfaCount = document.querySelectorAll("[typeof]").length;
+    return { jsonLd, microdataCount, rdfaCount, totalItems: jsonLd.length + microdataCount + rdfaCount };
+  }
+
+  // --- Open Graph ---
+  function auditOpenGraph() {
+    const allTags = {};
+    for (const m of document.querySelectorAll('meta[property^="og:"]')) {
+      const prop = m.getAttribute("property");
+      const content = m.getAttribute("content");
+      if (prop && content) allTags[prop.replace("og:", "")] = content;
+    }
+    return {
+      title: allTags["title"] || null,
+      description: allTags["description"] || null,
+      image: allTags["image"] || null,
+      url: allTags["url"] || null,
+      type: allTags["type"] || null,
+      siteName: allTags["site_name"] || null,
+      allTags
+    };
+  }
+
+  // --- Twitter Cards ---
+  function auditTwitterCard() {
+    const allTags = {};
+    for (const m of document.querySelectorAll('meta[name^="twitter:"], meta[property^="twitter:"]')) {
+      const name = m.getAttribute("name") || m.getAttribute("property");
+      const content = m.getAttribute("content");
+      if (name && content) allTags[name.replace("twitter:", "")] = content;
+    }
+    return {
+      card: allTags["card"] || null,
+      title: allTags["title"] || null,
+      description: allTags["description"] || null,
+      image: allTags["image"] || null,
+      site: allTags["site"] || null,
+      allTags
+    };
+  }
+
+  // --- Canonical & Hreflang ---
+  function auditCanonical() {
+    const canonEl = document.querySelector('link[rel="canonical"]');
+    const canonical = canonEl ? canonEl.getAttribute("href") : null;
+    const hreflangTags = [];
+    for (const el of document.querySelectorAll('link[hreflang]')) {
+      hreflangTags.push({ lang: el.getAttribute("hreflang") || "", href: el.getAttribute("href") || "" });
+    }
+    return {
+      canonical,
+      isCanonicalSelf: canonical ? canonical === url || canonical === location.pathname : false,
+      hreflangTags
+    };
+  }
+
+  // --- Robots ---
+  function auditRobots() {
+    const robotsEl = document.querySelector('meta[name="robots"]');
+    const metaRobots = robotsEl ? robotsEl.getAttribute("content") : null;
+    const directives = metaRobots ? metaRobots.split(",").map(d => d.trim().toLowerCase()) : [];
+    return {
+      metaRobots,
+      xRobotsTag: null,
+      isIndexable: !directives.includes("noindex"),
+      isFollowable: !directives.includes("nofollow"),
+      directives
+    };
+  }
+
+  // --- Content Metrics ---
+  function auditContent() {
+    const body = document.body;
+    const text = (body ? body.innerText : "") || "";
+    const htmlLength = (body ? body.innerHTML : "").length || 1;
+    const words = text.split(/\\s+/).filter(w => w.length > 0);
+    const wordCount = words.length;
+    const textLength = text.length;
+    const textToHtmlRatio = Math.round((textLength / htmlLength) * 100) / 100;
+    const readingTimeMinutes = Math.round((wordCount / 200) * 10) / 10;
+    return { wordCount, textToHtmlRatio, readingTimeMinutes };
+  }
+
+  // --- Technical ---
+  function auditTechnical() {
+    const doctype = document.doctype ? document.doctype.name : null;
+    const lang = document.documentElement.getAttribute("lang");
+    const charsetEl = document.querySelector('meta[charset]');
+    const charset = charsetEl ? charsetEl.getAttribute("charset") : null;
+    const viewportEl = document.querySelector('meta[name="viewport"]');
+    const viewportMeta = viewportEl ? viewportEl.getAttribute("content") : null;
+    const hasHttps = location.protocol === "https:";
+    const hasFavicon = !!document.querySelector('link[rel="icon"], link[rel="shortcut icon"]');
+    return { doctype, lang, charset, viewportMeta, hasHttps, hasFavicon };
+  }
+
+  // --- Scoring & Issues ---
+  function calculateScore(audit) {
+    const issues = [];
+    let total = 0, earned = 0;
+
+    // Meta (weight 15)
+    if (shouldRun("meta")) {
+      total += 15;
+      let s = 15;
+      if (!audit.meta.title) { s -= 5; issues.push({ code: "missing-title", severity: "error", message: "Page has no title tag", dimension: "meta" }); }
+      else if (audit.meta.titleLength > 60) { s -= 2; issues.push({ code: "title-too-long", severity: "warning", message: "Title is " + audit.meta.titleLength + " chars (recommended: 50-60)", dimension: "meta" }); }
+      else if (audit.meta.titleLength < 10) { s -= 2; issues.push({ code: "title-too-short", severity: "warning", message: "Title is only " + audit.meta.titleLength + " chars", dimension: "meta" }); }
+      if (!audit.meta.description) { s -= 5; issues.push({ code: "missing-description", severity: "error", message: "Page has no meta description", dimension: "meta" }); }
+      else if (audit.meta.descriptionLength > 160) { s -= 2; issues.push({ code: "description-too-long", severity: "warning", message: "Meta description is " + audit.meta.descriptionLength + " chars (recommended: 120-160)", dimension: "meta" }); }
+      if (!audit.meta.viewport) { s -= 3; issues.push({ code: "missing-viewport", severity: "error", message: "No viewport meta tag", dimension: "meta" }); }
+      earned += Math.max(0, s);
+    }
+
+    // Headings (weight 10)
+    if (shouldRun("headings")) {
+      total += 10;
+      let s = 10;
+      if (audit.headings.h1Count === 0) { s -= 5; issues.push({ code: "missing-h1", severity: "error", message: "Page has no H1 heading", dimension: "headings" }); }
+      else if (audit.headings.h1Count > 1) { s -= 3; issues.push({ code: "multiple-h1", severity: "warning", message: "Page has " + audit.headings.h1Count + " H1 headings (recommended: 1)", dimension: "headings" }); }
+      if (!audit.headings.hasValidHierarchy) { s -= 2; issues.push({ code: "heading-hierarchy", severity: "warning", message: "Heading hierarchy has gaps (e.g. H1 followed by H3)", dimension: "headings" }); }
+      earned += Math.max(0, s);
+    }
+
+    // Links (weight 10)
+    if (shouldRun("links")) {
+      total += 10;
+      let s = 10;
+      if (audit.links.broken > 0) { s -= Math.min(5, audit.links.broken); issues.push({ code: "broken-links", severity: "warning", message: audit.links.broken + " broken/empty links found", dimension: "links" }); }
+      if (audit.links.total === 0) { s -= 3; issues.push({ code: "no-links", severity: "info", message: "Page has no links", dimension: "links" }); }
+      earned += Math.max(0, s);
+    }
+
+    // Images (weight 10)
+    if (shouldRun("images")) {
+      total += 10;
+      let s = 10;
+      if (audit.images.withoutAlt > 0) {
+        const pct = Math.round((audit.images.withoutAlt / Math.max(1, audit.images.total)) * 100);
+        s -= Math.min(8, Math.ceil(pct / 12));
+        issues.push({ code: "images-missing-alt", severity: pct > 50 ? "error" : "warning", message: audit.images.withoutAlt + " of " + audit.images.total + " images missing alt text (" + pct + "%)", dimension: "images" });
+      }
+      earned += Math.max(0, s);
+    }
+
+    // Structured Data (weight 8)
+    if (shouldRun("structuredData")) {
+      total += 8;
+      let s = 8;
+      if (audit.structuredData.totalItems === 0) { s -= 4; issues.push({ code: "no-structured-data", severity: "info", message: "No structured data (JSON-LD, microdata, or RDFa) found", dimension: "structuredData" }); }
+      earned += Math.max(0, s);
+    }
+
+    // Open Graph (weight 8)
+    if (shouldRun("openGraph")) {
+      total += 8;
+      let s = 8;
+      if (!audit.openGraph.title) { s -= 3; issues.push({ code: "missing-og-title", severity: "warning", message: "No og:title meta tag", dimension: "openGraph" }); }
+      if (!audit.openGraph.description) { s -= 2; issues.push({ code: "missing-og-description", severity: "warning", message: "No og:description meta tag", dimension: "openGraph" }); }
+      if (!audit.openGraph.image) { s -= 3; issues.push({ code: "missing-og-image", severity: "warning", message: "No og:image meta tag", dimension: "openGraph" }); }
+      earned += Math.max(0, s);
+    }
+
+    // Twitter Card (weight 5)
+    if (shouldRun("twitterCard")) {
+      total += 5;
+      let s = 5;
+      if (!audit.twitterCard.card) { s -= 3; issues.push({ code: "missing-twitter-card", severity: "info", message: "No twitter:card meta tag", dimension: "twitterCard" }); }
+      earned += Math.max(0, s);
+    }
+
+    // Canonical (weight 10)
+    if (shouldRun("canonical")) {
+      total += 10;
+      let s = 10;
+      if (!audit.canonical.canonical) { s -= 5; issues.push({ code: "missing-canonical", severity: "warning", message: "No canonical URL defined", dimension: "canonical" }); }
+      earned += Math.max(0, s);
+    }
+
+    // Robots (weight 8)
+    if (shouldRun("robots")) {
+      total += 8;
+      let s = 8;
+      if (!audit.robots.isIndexable) { s -= 4; issues.push({ code: "noindex", severity: "info", message: "Page has noindex directive", dimension: "robots" }); }
+      if (!audit.robots.isFollowable) { s -= 2; issues.push({ code: "nofollow", severity: "info", message: "Page has nofollow directive", dimension: "robots" }); }
+      earned += Math.max(0, s);
+    }
+
+    // Content (weight 8)
+    if (shouldRun("content")) {
+      total += 8;
+      let s = 8;
+      if (audit.content.wordCount < 300) { s -= 4; issues.push({ code: "thin-content", severity: "warning", message: "Low word count (" + audit.content.wordCount + "). Consider adding more content (300+ words recommended)", dimension: "content" }); }
+      if (audit.content.textToHtmlRatio < 0.1) { s -= 2; issues.push({ code: "low-text-ratio", severity: "warning", message: "Text-to-HTML ratio is " + (audit.content.textToHtmlRatio * 100).toFixed(1) + "% (10%+ recommended)", dimension: "content" }); }
+      earned += Math.max(0, s);
+    }
+
+    // Technical (weight 8)
+    if (shouldRun("technical")) {
+      total += 8;
+      let s = 8;
+      if (!audit.technical.hasHttps) { s -= 4; issues.push({ code: "no-https", severity: "error", message: "Page not served over HTTPS", dimension: "technical" }); }
+      if (!audit.technical.lang) { s -= 2; issues.push({ code: "missing-lang", severity: "warning", message: "No lang attribute on <html> element", dimension: "technical" }); }
+      if (!audit.technical.hasFavicon) { s -= 1; issues.push({ code: "missing-favicon", severity: "info", message: "No favicon link tag found", dimension: "technical" }); }
+      earned += Math.max(0, s);
+    }
+
+    return { score: total > 0 ? Math.round((earned / total) * 100) : 0, issues };
+  }
+
+  const audit = {};
+  if (shouldRun("meta")) audit.meta = auditMeta();
+  if (shouldRun("headings")) audit.headings = auditHeadings();
+  if (shouldRun("links")) audit.links = auditLinks();
+  if (shouldRun("images")) audit.images = auditImages();
+  if (shouldRun("structuredData")) audit.structuredData = auditStructuredData();
+  if (shouldRun("openGraph")) audit.openGraph = auditOpenGraph();
+  if (shouldRun("twitterCard")) audit.twitterCard = auditTwitterCard();
+  if (shouldRun("canonical")) audit.canonical = auditCanonical();
+  if (shouldRun("robots")) audit.robots = auditRobots();
+  if (shouldRun("content")) audit.content = auditContent();
+  if (shouldRun("technical")) audit.technical = auditTechnical();
+
+  const { score, issues } = calculateScore(audit);
+  return { url, auditedAt, ...audit, score, issues };
+})()`,
+        }, TOOL_TIMEOUTS.seo_audit);
+        const data = result as { result?: unknown };
+        const audit = (data?.result ?? {}) as SeoAuditResult;
+        // Note: robots.xRobotsTag stays null — response headers are only available
+        // through network capture data, not from page context. Callers can enrich
+        // this field from captured Network.responseReceived headers.
+        return toolSuccess(audit);
+      },
+    },
+    {
+      name: "check_robots_txt",
+      description: "Fetch and parse the robots.txt file for the current page's domain. Returns disallowed paths, sitemap URLs, and crawl-delay. Uses an in-page fetch() to access the file (preserves same-origin cookies/auth). Requires debugger attached.",
+      inputSchema: { type: "object", properties: {} },
+      handler: async () => {
+        const result = await bridge.send({
+          type: "browser_evaluate",
+          expression: `(async () => {
+  const origin = location.origin;
+  const robotsUrl = origin + "/robots.txt";
+  try {
+    const resp = await fetch(robotsUrl, { credentials: "omit" });
+    if (!resp.ok) return { url: robotsUrl, found: false, content: null, sitemapUrls: [], disallowedPaths: [], crawlDelay: null };
+    const text = await resp.text();
+    const sitemapUrls = [];
+    const disallowedPaths = [];
+    let crawlDelay = null;
+    for (const line of text.split("\\n")) {
+      const trimmed = line.trim();
+      if (trimmed.toLowerCase().startsWith("sitemap:")) sitemapUrls.push(trimmed.slice(8).trim());
+      if (trimmed.toLowerCase().startsWith("disallow:")) { const p = trimmed.slice(9).trim(); if (p) disallowedPaths.push(p); }
+      if (trimmed.toLowerCase().startsWith("crawl-delay:")) { const d = parseFloat(trimmed.slice(12).trim()); if (!isNaN(d)) crawlDelay = d; }
+    }
+    return { url: robotsUrl, found: true, content: text.slice(0, 10000), sitemapUrls, disallowedPaths, crawlDelay };
+  } catch (e) {
+    return { url: robotsUrl, found: false, content: null, sitemapUrls: [], disallowedPaths: [], crawlDelay: null };
+  }
+})()`,
+        }, TOOL_TIMEOUTS.check_robots_txt);
+        const data = result as { result?: unknown };
+        return toolSuccess(data?.result ?? { url: "", found: false, content: null, sitemapUrls: [], disallowedPaths: [], crawlDelay: null });
+      },
+    },
+    {
+      name: "check_sitemap",
+      description: "Fetch and parse the sitemap.xml file for the current page's domain. Returns URL count, sample URLs, and last modified date. Tries /sitemap.xml first, then checks robots.txt for sitemap references. Requires debugger attached.",
+      inputSchema: { type: "object", properties: {} },
+      handler: async () => {
+        const result = await bridge.send({
+          type: "browser_evaluate",
+          expression: `(async () => {
+  const origin = location.origin;
+  async function trySitemap(sitemapUrl) {
+    try {
+      const resp = await fetch(sitemapUrl, { credentials: "omit" });
+      if (!resp.ok) return null;
+      const text = await resp.text();
+      const urlMatches = text.match(/<loc>([^<]+)<\\/loc>/g) || [];
+      const urls = urlMatches.map(m => m.replace(/<\\/?loc>/g, ""));
+      const lastmodMatch = text.match(/<lastmod>([^<]+)<\\/lastmod>/);
+      return { url: sitemapUrl, found: true, urlCount: urls.length, sampleUrls: urls.slice(0, 20), lastmod: lastmodMatch ? lastmodMatch[1] : null };
+    } catch { return null; }
+  }
+  // Try default location
+  let result = await trySitemap(origin + "/sitemap.xml");
+  if (result) return result;
+  // Try from robots.txt
+  try {
+    const robotsResp = await fetch(origin + "/robots.txt", { credentials: "omit" });
+    if (robotsResp.ok) {
+      const robotsText = await robotsResp.text();
+      for (const line of robotsText.split("\\n")) {
+        if (line.trim().toLowerCase().startsWith("sitemap:")) {
+          const sitemapUrl = line.trim().slice(8).trim();
+          result = await trySitemap(sitemapUrl);
+          if (result) return result;
+        }
+      }
+    }
+  } catch {}
+  return { url: origin + "/sitemap.xml", found: false, urlCount: 0, sampleUrls: [], lastmod: null };
+})()`,
+        }, TOOL_TIMEOUTS.check_sitemap);
+        const data = result as { result?: unknown };
+        return toolSuccess(data?.result ?? { url: "", found: false, urlCount: 0, sampleUrls: [], lastmod: null });
+      },
+    },
+    // --- Raw vs Rendered Comparison (Phase 5) ---
+    {
+      name: "compare_raw_rendered",
+      description: "Compare raw HTML (pre-JavaScript) vs rendered DOM (post-JavaScript) to detect JS-dependent SEO content. Identifies differences in title, meta description, headings, canonical, structured data, links, and content size. Returns a risk assessment for search engine visibility. Requires debugger attached and network capture active (best when page was loaded with capture running).",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+      handler: async () => {
+        const result = await bridge.send({
+          type: "compare_raw_rendered",
+        } as BridgeCommand, TOOL_TIMEOUTS.compare_raw_rendered);
+        return toolSuccess(result);
+      },
+    },
+    // --- CrUX Metrics (Phase 5) ---
+    {
+      name: "crux_metrics",
+      description: "Fetch Chrome User Experience Report (CrUX) field data for a URL — real-world Core Web Vitals from millions of Chrome users. Returns p75 values for LCP, CLS, INP, TTFB with good/needs-improvement/poor assessment. Requires a Google CrUX API key (pass as api_key or set CRUX_API_KEY env var). Low-traffic URLs may have no data — falls back to origin-level metrics automatically.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "The URL to query CrUX data for" },
+          api_key: { type: "string", description: "Google CrUX API key. Falls back to CRUX_API_KEY env var if omitted." },
+          form_factor: { type: "string", enum: ["PHONE", "DESKTOP", "TABLET"], description: "Filter by device type. Omit for all form factors." },
+        },
+        required: ["url"],
+      },
+      handler: async (args: Record<string, unknown>) => {
+        const schema = z.object({
+          url: z.string().url(),
+          api_key: z.string().optional(),
+          form_factor: z.enum(["PHONE", "DESKTOP", "TABLET"]).optional(),
+        });
+        const parsed = schema.parse(args);
+        const metrics = await fetchCruxMetrics(parsed.url, parsed.api_key, parsed.form_factor);
+        return toolSuccess(metrics);
+      },
+    },
+    // --- SEO Intelligence Settings (Phase 6) ---
+    {
+      name: "set_seo_intelligence",
+      description: "Configure passive SEO intelligence behavior. Controls auto-badge (SERP detection badge on Google SERPs), auto-overlay (automatic SERP overlay injection), and master enable/disable toggle. All settings are partial — omit a field to keep its current value.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          enabled: { type: "boolean", description: "Master toggle — disables all auto-SERP behavior when false" },
+          autoOverlay: { type: "boolean", description: "Auto-inject SERP overlay on Google SERPs when debugger attached (default: false — opt-in)" },
+          autoBadge: { type: "boolean", description: "Auto-update badge/tooltip on SERP detection (default: true — non-intrusive)" },
+        },
+      },
+      handler: async (args: Record<string, unknown>) => {
+        const data = await bridge.send({
+          type: "set_seo_intelligence",
+          ...(args.enabled !== undefined && { enabled: args.enabled }),
+          ...(args.autoOverlay !== undefined && { autoOverlay: args.autoOverlay }),
+          ...(args.autoBadge !== undefined && { autoBadge: args.autoBadge }),
+        } as BridgeCommand, TOOL_TIMEOUTS.set_seo_intelligence);
+        return toolSuccess(data);
+      },
+    },
+    {
+      name: "get_seo_intelligence",
+      description: "Get current SEO intelligence settings (enabled, autoOverlay, autoBadge).",
+      inputSchema: { type: "object", properties: {} },
+      handler: async () => {
+        const data = await bridge.send({
+          type: "get_seo_intelligence",
+        } as BridgeCommand, TOOL_TIMEOUTS.get_seo_intelligence);
+        return toolSuccess(data);
+      },
+    },
   ];
 }
 
@@ -3115,7 +3919,7 @@ function observeField(data: PageEvidence & { gaps?: CoverageGap[] }, dimension: 
     }
     case "data-structure":
       return (data.meta?._structuredData?.length ?? 0) > 0
-        ? { type: "present", dimension, value: { structuredDataCount: data.meta!._structuredData.length } }
+        ? { type: "present", dimension, value: { structuredDataCount: data.meta?._structuredData?.length ?? 0 } }
         : { type: "absent", dimension };
     default:
       return { type: "absent", dimension };
@@ -3251,7 +4055,8 @@ async function buildSmartObject(bridge: WebSocketBridge): Promise<Record<string,
       await pollActionability(bridge, selector, timeout ?? 5000);
       return { found: true, selector };
     },
-    snapshot: () => bridge.send({ type: "browser_snapshot" }, 10000),
+    snapshot: (opts?: { interactive?: boolean; compact?: boolean; maxDepth?: number; selector?: string }) =>
+      bridge.send({ type: "browser_snapshot", ...opts }, 10000),
     rebuild: async () => {
       smartObjectCache = null;
       const fresh = await buildSmartObject(bridge);
@@ -3685,6 +4490,61 @@ async function buildSmartObject(bridge: WebSocketBridge): Promise<Record<string,
     };
   };
 
+  // --- Detection Wedge: Tracking Pixel Parser ---
+  smart.parseTrackingPixels = async (): Promise<TrackingParseResult> => {
+    const data = await bridge.send({ type: "parse_tracking_pixels" }, 10000) as TrackingParseResult;
+    return data;
+  };
+
+  // --- Detection Wedge: Tracking Event Validation ---
+  smart.validateTracking = async (): Promise<TrackingValidationResult> => {
+    const parseResult = await bridge.send({ type: "parse_tracking_pixels" }, 10000) as TrackingParseResult;
+    return validateTrackingEvents(parseResult);
+  };
+
+  // --- Detection Wedge: DataLayer Inspection ---
+  smart.inspectDataLayer = async (): Promise<DataLayerState> => {
+    return await bridge.send({ type: "inspect_datalayer" }, 10000) as DataLayerState;
+  };
+
+  // --- Detection Wedge: Duplicate Event Detection ---
+  smart.detectDuplicates = async (): Promise<DuplicateCluster[]> => {
+    const parseResult = await bridge.send({ type: "parse_tracking_pixels" }, 10000) as TrackingParseResult;
+    return detectDuplicates(parseResult.events);
+  };
+
+  smart.detectTechnologies = async (opts?: { confidenceThreshold?: number }): Promise<TechnographicResult> => {
+    const threshold = opts?.confidenceThreshold ?? 1;
+
+    // Run capture_page to get network entries + cookies, plus parallel JS-based signal collection
+    const [capture, metaResult, jsResult, htmlResult] = await Promise.all([
+      bridge.send({ type: "capture_page" }, 20000) as Promise<PageCapture>,
+      evaluate(META_TAG_EXTRACTION_EXPR).catch(() => ({ result: {} })),
+      evaluate(buildJSGlobalsCheckExpr()).catch(() => ({ result: {} })),
+      evaluate("document.documentElement.outerHTML.substring(0, 50000)").catch(() => ({ result: "" })),
+    ]) as [
+      PageCapture,
+      { result: Record<string, string> },
+      { result: Record<string, string | null> },
+      { result: string },
+    ];
+
+    const pageUrl = capture?.url || "";
+
+    const signals = collectSignals({
+      networkEntries: capture.networkRequests || [],
+      cookies: capture.cookies || [],
+      metaTags: (metaResult as { result: Record<string, string> }).result as Record<string, string>,
+      jsGlobals: (jsResult as { result: Record<string, string | null> }).result as Record<string, string | null>,
+      url: pageUrl,
+      html: typeof (htmlResult as { result: string }).result === "string" ? (htmlResult as { result: string }).result : undefined,
+    });
+
+    const detections = matchFingerprints(signals);
+    const filtered = threshold > 0 ? detections.filter(d => d.confidence >= threshold) : detections;
+    return buildTechnographicResult(filtered, signals, 50);
+  };
+
   smart.scrollCapture = async (opts?: {
     maxSections?: number;
     pixelsPerScroll?: number;
@@ -3845,6 +4705,16 @@ async function buildSmartObject(bridge: WebSocketBridge): Promise<Record<string,
       siteB: { url: urlB, ...b },
       scaffold,
     };
+  };
+
+  smart.diffSnapshots = async (before?: string): Promise<SnapshotDiffResult> => {
+    // Get baseline + current from extension (uses cached lastSnapshot if before not provided)
+    const extensionResult = await bridge.send({
+      type: "diff_snapshot",
+      ...(before !== undefined && { baseline: before }),
+    }, 10000) as { baseline: string; current: string };
+
+    return computeDiff(extensionResult.baseline, extensionResult.current);
   };
 
   return smart;
@@ -4015,6 +4885,14 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
         "Execute JavaScript code with access to the browser bridge, Crawlio HTTP client, and smart object.",
         "Use search() first to discover available commands and their parameters.",
         "",
+        "IMPORTANT WARNINGS:",
+        "- smart.screenshot() does NOT exist. For screenshots: bridge.send({ type: 'take_screenshot' }).",
+        "- For structured page evidence, prefer smart.extractPage() — runs 7 ops in parallel with typed gaps[].",
+        "- capture_page returns a ~1KB shaped summary. For raw data, use stop_network_capture or get_console_logs.",
+        "- Use smart.waitForIdle() instead of sleep(). Use smart.scrollCapture() instead of manual scroll loops.",
+        "- smart.snapshot() takes no options or { interactive: true } — there is no { compact: true } option.",
+        "- For cross-page navigation, use smart.navigate(url) — never location.href = \"...\" (breaks CDP).",
+        "",
         "Available in scope:",
         "- bridge.send(command, timeout?) — send command to browser extension via WebSocket",
         "  command must have a `type` field matching a command name (e.g. { type: 'list_tabs' })",
@@ -4033,13 +4911,16 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
         "- TIMEOUTS — per-command timeout constants",
         "- compileRecording(session, { name, description? }) — compile RecordingSession to SKILL.md",
         "  Returns { skillMarkdown, name, pageCount, interactionCount }",
+        "- ocrScreenshot(opts?) — extract text from current page via macOS Vision.framework OCR (macOS only)",
+        "  opts: { fullPage?: boolean, selector?: string }",
+        "  Returns { regions: [{ text, confidence, bounds }], regionsLimited? }",
         "- smart — auto-waiting wrappers and framework-specific data accessors:",
         "  smart.evaluate(expr) → {result, type} — access .result for value. Never JSON.parse() the return directly.",
         "  smart.click(selector, opts?) — poll + click + 500ms settle (accepts CSS or snapshot [ref=X])",
         "  smart.type(selector, text, opts?) — poll + type + 300ms settle",
         "  smart.navigate(url, opts?) — navigate + 1000ms settle",
         "  smart.waitFor(selector, timeout?) — poll until actionable",
-        "  smart.snapshot() — capture accessibility snapshot",
+        "  smart.snapshot(opts?) — capture accessibility snapshot (opts: { interactive: true } for clickable elements only — NO compact option)",
         "  smart.scrollCapture(opts?) — state-aware page scroll with screenshots, stops at page bottom",
         "  smart.waitForIdle(timeout?) — wait for DOM mutations to settle (500ms quiet window)",
         "  smart.extractPage(opts?) — capture_page + perf + security + fonts + meta + accessibility + mobileReadiness. Returns { capture, performance, security, fonts, meta, accessibility, mobileReadiness, gaps[] }. opts: { trace: true } adds _trace.",
@@ -4051,6 +4932,12 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
         "  smart.extractTable(selector, opts?) — extract structured data from a container. Returns { columns, rows, totalRows, truncated }. opts: { maxRows: 200 }.",
         "  smart.waitForNetworkIdle(opts?) — wait for all network requests to settle (CDP-level, catches fetch/XHR/images/CSS/fonts). Returns { status, elapsed }. opts: { timeout: 15000, idleTime: 500 }.",
         "  smart.extractData(opts?) — compound: detectTables + extractTable + JSON-LD. Returns { tables, structuredData, url }.",
+        "  smart.parseTrackingPixels() — parse captured network data for tracking pixel fires (Facebook, GA4, TikTok, LinkedIn, Pinterest). Returns { totalPixelFires, vendors, pixels, events, unrecognizedTrackingUrls }.",
+        "  smart.validateTracking() — validate tracking events against per-vendor parameter schemas (Facebook 18 standard + GA4 recommended). Returns { events, issues, errorCount, warningCount, infoCount, isHealthy }. Each issue has severity (error/warning/info), code, message, recommendation, and optional parameter.",
+        "  smart.inspectDataLayer() — inspect tracker runtime state via CDP (fbq queue, GA4 dataLayer, GTM containers, TikTok ttq). Returns DataLayerState with null for absent trackers. No content script needed.",
+        "  smart.detectDuplicates() — detect duplicate pixel fires grouped by vendor+pixelId+eventName+URL. Excludes PageView (legitimate SPA behavior). Returns DuplicateCluster[] with count and timestamps.",
+        "  smart.detectTechnologies(opts?) — detect technologies via fingerprint matching against CDP signals (headers, scripts, JS globals, meta, cookies, URL). Returns TechnographicResult { technologies[], categories, totalDetected, highConfidenceCount, signalsUsed }. Each technology has numeric confidence (0-100, additive), version, matchedSignals[]. opts: { confidenceThreshold: 1 }.",
+        "  smart.diffSnapshots(before?) — Myers diff current ARIA snapshot against baseline. If before omitted, uses last cached snapshot. Returns { diff, additions, removals, unchanged, changed }.",
         "  Framework namespaces (injected based on detected framework):",
         "  smart.react.{getVersion,getRootCount,hasProfiler,isHookInstalled}",
         "  smart.vue.{getVersion,getAppCount,getConfig,isDevMode}",
@@ -4106,6 +4993,30 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
         const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
         const sleepFn = (ms: number) => new Promise<void>(r => setTimeout(r, Math.min(ms, 30000)));
 
+        // OCR function exposed in sandbox scope (macOS only, uses bridge + swift shim)
+        const ocrScreenshot = async (opts?: { fullPage?: boolean; selector?: string }) => {
+          if (process.platform !== "darwin") throw new Error("ocrScreenshot requires macOS (Vision.framework)");
+          const screenshotParams: Record<string, unknown> = { type: "take_screenshot" };
+          if (opts?.fullPage) screenshotParams.fullPage = true;
+          if (opts?.selector) screenshotParams.selector = opts.selector;
+          const data = await bridge.send(screenshotParams as BridgeCommand, 30000) as { data: string };
+          if (!data?.data) throw new Error("Screenshot capture failed — no image data returned");
+          const tmpPath = join(tmpdir(), `crawlio-ocr-${randomBytes(6).toString("hex")}.png`);
+          try {
+            await writeFile(tmpPath, Buffer.from(data.data, "base64"));
+            const shimPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "bin", "ocr-shim.swift");
+            const { stdout } = await execFileAsync("swift", [shimPath, tmpPath], { timeout: 25000 });
+            if (!stdout.trim()) throw new Error("OCR produced no output");
+            const result = JSON.parse(stdout.trim());
+            if (result.error) throw new Error(`OCR failed: ${result.error}`);
+            if (result.regions?.length > 20) {
+              result.regions = result.regions.sort((a: { confidence: number }, b: { confidence: number }) => b.confidence - a.confidence).slice(0, 20);
+              result.regionsLimited = true;
+            }
+            return result;
+          } finally { unlink(tmpPath).catch(() => {}); }
+        };
+
         // Build smart object with framework-aware helpers (cached per URL)
         let currentUrl = "";
         try {
@@ -4124,7 +5035,7 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
 
         let fn: (...args: unknown[]) => Promise<unknown>;
         try {
-          fn = new AsyncFunction("bridge", "crawlio", "sleep", "TIMEOUTS", "smart", "compileRecording", code);
+          fn = new AsyncFunction("bridge", "crawlio", "sleep", "TIMEOUTS", "smart", "compileRecording", "ocrScreenshot", code);
         } catch (syntaxError) {
           return toolError(`Syntax error in code: ${syntaxError instanceof Error ? syntaxError.message : String(syntaxError)}`);
         }
@@ -4134,7 +5045,7 @@ export function createCodeModeTools(bridge: WebSocketBridge, crawlio: CrawlioCli
 
         try {
           const result = await Promise.race([
-            fn(bridge, crawlio, sleepFn, TOOL_TIMEOUTS, smart, compileRecording),
+            fn(bridge, crawlio, sleepFn, TOOL_TIMEOUTS, smart, compileRecording, ocrScreenshot),
             new Promise<never>((_, reject) => {
               controller.signal.addEventListener("abort", () =>
                 reject(new Error("Code execution timeout (120s)"))

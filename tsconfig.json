@@ -4,6 +4,7 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "strict": true,
+    // "noUncheckedIndexedAccess": true, // TODO: enable after major refactor
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
@@ -11,7 +12,6 @@
     "rootDir": "src",
     "declaration": true,
     "declarationMap": true,
-    "sourceMap": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
     "paths": {

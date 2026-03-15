@@ -157,6 +157,57 @@ body {
   background: var(--accent-hover);
 }
 
+/* --- Waiting card (auto-connect state) --- */
+.waiting-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0;
+}
+
+.waiting-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-300);
+  flex-shrink: 0;
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+.waiting-text {
+  font-size: 13px;
+  color: var(--text-200);
+}
+
+.reconnect-link {
+  display: inline-block;
+  background: none;
+  border: none;
+  color: var(--text-300);
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 0;
+  margin-top: 2px;
+}
+
+.reconnect-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.reconnect-link:disabled {
+  opacity: 0.5;
+  cursor: default;
+  text-decoration: none;
+}
+
 /* --- Buttons --- */
 .btn {
   display: block;

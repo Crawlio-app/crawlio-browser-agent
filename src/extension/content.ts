@@ -37,15 +37,28 @@ connectPort();
 // Request-response messages stay on runtime.onMessage (DETECT_FRAMEWORK, GET_DOM_SNAPSHOT)
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "DETECT_FRAMEWORK") {
-    sendResponse(detectFramework());
+    try {
+      sendResponse(detectFramework());
+    } catch (e) {
+      sendResponse({ error: `detectFramework failed: ${e}` });
+    }
     return true;
   }
 
   if (message.type === "GET_DOM_SNAPSHOT") {
-    sendResponse(getDOMSnapshot(message.maxDepth ?? 10));
+    try {
+      sendResponse(getDOMSnapshot(message.maxDepth ?? 10));
+    } catch (e) {
+      sendResponse({ error: `getDOMSnapshot failed: ${e}` });
+    }
     return true;
   }
 });
+
+// Boundary-aware cookie check — avoids false positives from substring matching
+function hasCookie(name: string): boolean {
+  return document.cookie.split(';').some(c => c.trim().startsWith(name + '='));
+}
 
 // --- Framework Detection (ah-17: multi-framework + version extraction + confidence) ---
 
@@ -275,7 +288,7 @@ function detectFramework(): any {
   if (w.Laravel) {
     detections.push({ name: "Laravel", confidence: "high", method: "global-var" });
   } else if (document.querySelector('meta[name="csrf-token"]') || document.querySelector('input[name="_token"]')) {
-    const hasCsrfCookie = document.cookie.includes("XSRF-TOKEN") || document.cookie.includes("laravel_session");
+    const hasCsrfCookie = hasCookie("XSRF-TOKEN") || hasCookie("laravel_session");
     if (hasCsrfCookie || document.querySelector('meta[name="csrf-token"]')) {
       detections.push({ name: "Laravel", confidence: hasCsrfCookie ? "high" : "medium", method: hasCsrfCookie ? "cookie" : "dom-attr" });
     }
@@ -283,8 +296,8 @@ function detectFramework(): any {
   // Django — window.django, window.__admin_media_prefix__, csrfmiddlewaretoken input, csrftoken cookie
   if (w.django || w.__admin_media_prefix__) {
     detections.push({ name: "Django", confidence: "high", method: "global-var" });
-  } else if (document.querySelector('input[name="csrfmiddlewaretoken"]') || document.cookie.includes("csrftoken")) {
-    detections.push({ name: "Django", confidence: "medium", method: document.cookie.includes("csrftoken") ? "cookie" : "dom-attr" });
+  } else if (document.querySelector('input[name="csrfmiddlewaretoken"]') || hasCookie("csrftoken")) {
+    detections.push({ name: "Django", confidence: "medium", method: hasCookie("csrftoken") ? "cookie" : "dom-attr" });
   }
   // Ruby on Rails — window._rails_loaded, csrf-param meta, _session_id cookie
   if (w._rails_loaded) {
@@ -353,8 +366,8 @@ function detectFramework(): any {
   // --- Long-tail Builders + E-commerce (fw-tier4) ---
   // GoDaddy — cookie dps_site_id, meta generator
   const godaddyMeta = document.querySelector('meta[name="generator"][content*="GoDaddy"]');
-  if (godaddyMeta || document.cookie.includes("dps_site_id")) {
-    detections.push({ name: "GoDaddy", confidence: document.cookie.includes("dps_site_id") ? "high" : "medium", method: document.cookie.includes("dps_site_id") ? "cookie" : "meta-generator" });
+  if (godaddyMeta || hasCookie("dps_site_id")) {
+    detections.push({ name: "GoDaddy", confidence: hasCookie("dps_site_id") ? "high" : "medium", method: hasCookie("dps_site_id") ? "cookie" : "meta-generator" });
   }
   // Tilda — script src tildacdn
   if (document.querySelector('script[src*="tildacdn"]') || document.querySelector('link[href*="tildacdn"]')) {
@@ -384,13 +397,13 @@ function detectFramework(): any {
     detections.push({ name: "PrestaShop", confidence: "high", method: "global-var" });
   } else {
     const prestaMeta = document.querySelector('meta[name="generator"][content*="PrestaShop"]');
-    if (prestaMeta || document.cookie.includes("prestashop")) {
+    if (prestaMeta || hasCookie("prestashop")) {
       detections.push({ name: "PrestaShop", confidence: prestaMeta ? "medium" : "high", method: prestaMeta ? "meta-generator" : "cookie" });
     }
   }
   // OpenCart — link[href*="opencart"], ocsessid cookie
-  if (document.querySelector('link[href*="opencart"]') || document.cookie.includes("ocsessid")) {
-    detections.push({ name: "OpenCart", confidence: document.cookie.includes("ocsessid") ? "high" : "medium", method: document.cookie.includes("ocsessid") ? "cookie" : "dom-attr" });
+  if (document.querySelector('link[href*="opencart"]') || hasCookie("ocsessid")) {
+    detections.push({ name: "OpenCart", confidence: hasCookie("ocsessid") ? "high" : "medium", method: hasCookie("ocsessid") ? "cookie" : "dom-attr" });
   }
   // Hydrogen — content script has no header access (header-based detection in background.ts only)
 
@@ -419,11 +432,16 @@ function getDOMSnapshot(maxDepth: number): any {
   const SKIP = new Set(["SCRIPT", "STYLE", "SVG", "NOSCRIPT"]);
   const EVENT_RE = /^on[a-z]+$/i;
   const MAX_SNAPSHOT = 5 * 1024 * 1024; // 5MB
+  const MAX_NODES = 50_000;
+  let nodeCount = 0;
+  let nodeLimitReached = false;
   let shadowRootCount = 0;
   let maxDepthReached = 0;
 
   function walk(el: Element, depth: number): any {
     if (depth > maxDepth) return null;
+    if (nodeCount >= MAX_NODES) { nodeLimitReached = true; return null; }
+    nodeCount++;
     if (depth > maxDepthReached) maxDepthReached = depth;
     if (SKIP.has(el.tagName)) return null;
     const node: any = { tag: el.tagName.toLowerCase() };
@@ -522,10 +540,11 @@ function getDOMSnapshot(maxDepth: number): any {
 
   const metadata = {
     sizeBytes: html.length,
-    truncated,
+    truncated: truncated || nodeLimitReached,
     shadowRoots: shadowRootCount,
     iframeCount: iframes.length,
     depth: maxDepthReached,
+    ...(nodeLimitReached ? { _truncated: true, nodeCount, maxNodes: MAX_NODES } : {}),
   };
 
   return { tree, html, iframes, metadata };

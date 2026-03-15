@@ -1,6 +1,6 @@
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer, type Server } from "http";
-import { randomUUID } from "crypto";
+import { randomUUID, timingSafeEqual } from "crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { mkdirSync, writeFileSync, unlinkSync, readdirSync, readFileSync } from "node:fs";
@@ -243,6 +243,43 @@ interface ConnectionHealth {
 const HEARTBEAT_INTERVAL = WS_HEARTBEAT_INTERVAL;
 const STALE_THRESHOLD = WS_STALE_THRESHOLD;
 
+const WS_RATE_LIMIT = 60; // max commands per second
+
+class SlidingWindowRateLimiter {
+  private timestamps: number[] = [];
+  private readonly maxPerSecond: number;
+
+  constructor(maxPerSecond: number) {
+    this.maxPerSecond = maxPerSecond;
+  }
+
+  allow(): boolean {
+    const now = Date.now();
+    const windowStart = now - 1000;
+    // Remove expired timestamps
+    while (this.timestamps.length > 0 && this.timestamps[0] <= windowStart) {
+      this.timestamps.shift();
+    }
+    if (this.timestamps.length >= this.maxPerSecond) return false;
+    this.timestamps.push(now);
+    return true;
+  }
+}
+
+const HEALTH_CORS_ORIGINS = [
+  "chrome-extension://",
+  "http://127.0.0.1",
+  "http://localhost",
+];
+
+function isAllowedHealthOrigin(origin: string | undefined): string | null {
+  if (!origin) return null;
+  for (const allowed of HEALTH_CORS_ORIGINS) {
+    if (origin.startsWith(allowed)) return origin;
+  }
+  return null;
+}
+
 async function findAvailablePort(start: number): Promise<number> {
   for (let port = start; port <= WS_PORT_MAX; port++) {
     try {
@@ -281,11 +318,12 @@ function cleanStaleBridgeFiles(): void {
   } catch { /* BRIDGE_DIR doesn't exist yet — fine */ }
 }
 
-function writeBridgeFile(port: number): string {
+function writeBridgeFile(port: number, token: string): string {
   mkdirSync(BRIDGE_DIR, { recursive: true });
   const bridgeFile = join(BRIDGE_DIR, `${process.pid}.json`);
   writeFileSync(bridgeFile, JSON.stringify({
     port,
+    token,
     pid: process.pid,
     cwd: process.cwd(),
     startedAt: Date.now(),
@@ -303,6 +341,8 @@ export class WebSocketBridge {
   private client: WebSocket | null = null;
   private pending = new Map<string, PendingRequest>();
   private messageQueue = new MessageQueue();
+  private readonly bridgeToken = randomUUID();
+  private rateLimiter = new SlidingWindowRateLimiter(WS_RATE_LIMIT);
 
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectGraceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -351,7 +391,9 @@ export class WebSocketBridge {
 
   push(data: unknown): void {
     if (!this.isConnected) return;
-    this.client!.send(JSON.stringify(data));
+    this.client!.send(JSON.stringify(data), (err) => {
+      if (err) console.error("[Bridge] Push failed:", err.message);
+    });
   }
 
   async start(): Promise<void> {
@@ -365,21 +407,36 @@ export class WebSocketBridge {
         return;
       }
       if (req.url === "/health") {
-        res.writeHead(200, {
+        const origin = req.headers.origin;
+        const corsOrigin = isAllowedHealthOrigin(origin);
+        const headers: Record<string, string> = {
           "Content-Type": "application/json",
           "Cache-Control": "no-store",
-          "Access-Control-Allow-Origin": "*",
-        });
-        res.end(JSON.stringify({ service: "crawlio-mcp", pid: process.pid, port: this.actualPort, ...this.getHealth() }));
+          "Access-Control-Allow-Private-Network": "true",
+        };
+        if (corsOrigin) headers["Access-Control-Allow-Origin"] = corsOrigin;
+        res.writeHead(200, headers);
+        res.end(JSON.stringify({
+          service: "crawlio-mcp",
+          pid: process.pid,
+          port: this.actualPort,
+          token: this.bridgeToken,
+          ...this.getHealth(),
+        }));
         return;
       }
       // CORS preflight for extension fetch (no host_permissions)
       if (req.method === "OPTIONS") {
-        res.writeHead(204, {
-          "Access-Control-Allow-Origin": "*",
+        const origin = req.headers.origin;
+        const corsOrigin = isAllowedHealthOrigin(origin);
+        const headers: Record<string, string> = {
           "Access-Control-Allow-Methods": "GET, OPTIONS",
+          "Access-Control-Allow-Headers": "*",
+          "Access-Control-Allow-Private-Network": "true",
           "Access-Control-Max-Age": "86400",
-        });
+        };
+        if (corsOrigin) headers["Access-Control-Allow-Origin"] = corsOrigin;
+        res.writeHead(204, headers);
         res.end();
         return;
       }
@@ -394,6 +451,24 @@ export class WebSocketBridge {
         info: { origin?: string; secure: boolean; req: import("http").IncomingMessage },
         callback: (result: boolean, code?: number, message?: string) => void
       ) => {
+        // Token validation — extract from ?token=xxx query param
+        const reqUrl = info.req.url;
+        if (reqUrl) {
+          try {
+            const params = new URL(reqUrl, "http://localhost").searchParams;
+            const clientToken = params.get("token");
+            if (clientToken) {
+              const a = Buffer.from(this.bridgeToken);
+              const b = Buffer.from(clientToken);
+              if (a.length === b.length && timingSafeEqual(a, b)) {
+                callback(true);
+                return;
+              }
+            }
+          } catch { /* malformed URL — fall through */ }
+        }
+
+        // Origin-based fallback for clients without token (backward compat)
         const origin = info.origin;
         // No origin header — Node.js clients (stdio), some extension contexts
         if (!origin || origin === "null") { callback(true); return; }
@@ -407,7 +482,7 @@ export class WebSocketBridge {
           }
         } catch { /* invalid URL — fall through to reject */ }
         // Reject with 403 (NOT 401) — 401 triggers Chrome's "HTTP Authentication failed" error
-        console.error(`[Bridge] WebSocket origin rejected: ${origin}`);
+        console.error(`[Bridge] WebSocket connection rejected: missing/invalid token, origin: ${origin}`);
         callback(false, 403, "Forbidden");
       },
     });
@@ -469,6 +544,10 @@ export class WebSocketBridge {
 
       ws.on("message", (raw) => {
         try {
+          if (!this.rateLimiter.allow()) {
+            ws.send(JSON.stringify({ error: "Rate limited. Max 60 commands/second.", code: "RATE_LIMITED" }));
+            return;
+          }
           const len = typeof raw === "string" ? Buffer.byteLength(raw) : (raw as Buffer).length;
           if (len > 5 * 1024 * 1024) {
             console.error(`[Bridge] Oversized message dropped: ${(len / 1024 / 1024).toFixed(1)} MB`);
@@ -505,7 +584,7 @@ export class WebSocketBridge {
         this.client = null;
         this.connectTime = 0;
         // Grace period: wait for extension to reconnect before rejecting pending commands
-        // (Playwright MCP #1140 — premature session deletion on transport close)
+        // Prevent premature session deletion on transport close
         if (this.pending.size > 0) {
           console.error(`[Bridge] ${this.pending.size} pending commands — waiting ${WS_RECONNECT_GRACE / 1000}s for reconnect`);
           this.reconnectGraceTimer = setTimeout(() => {
@@ -558,7 +637,7 @@ export class WebSocketBridge {
     });
 
     // Write bridge file for extension discovery
-    writeBridgeFile(this.actualPort);
+    writeBridgeFile(this.actualPort, this.bridgeToken);
 
     // Cleanup on exit
     const cleanup = () => removeBridgeFile();
@@ -645,7 +724,10 @@ export class WebSocketBridge {
         }
         this.pending.delete(msg.id);
       }
+      return;
     }
+
+    console.error("[Bridge] Unrecognized message type:", msg.type);
   }
 
   async stop(): Promise<void> {

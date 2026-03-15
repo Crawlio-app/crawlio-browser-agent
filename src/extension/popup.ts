@@ -11,7 +11,8 @@ const PERM_LABELS: Record<string, string> = {
 };
 
 (async () => {
-  const connectBtn = document.getElementById("connect-btn") as HTMLButtonElement;
+  const waitingCard = document.getElementById("waiting-card") as HTMLElement;
+  const reconnectBtn = document.getElementById("reconnect-btn") as HTMLButtonElement;
   const disconnectBtn = document.getElementById("disconnect-btn") as HTMLButtonElement;
   const setupCard = document.getElementById("setup-card") as HTMLElement;
   const setupPerms = document.getElementById("setup-perms") as HTMLElement;
@@ -25,7 +26,8 @@ const PERM_LABELS: Record<string, string> = {
   const statusRow = document.querySelector(".status-row") as HTMLElement | null;
 
   function updateUI(connected: boolean) {
-    connectBtn.style.display = connected ? "none" : "block";
+    waitingCard.style.display = connected ? "none" : "flex";
+    reconnectBtn.style.display = connected ? "none" : "inline-block";
     disconnectBtn.style.display = connected ? "block" : "none";
     if (statusRow) {
       statusRow.style.display = connected ? "flex" : "none";
@@ -126,11 +128,11 @@ const PERM_LABELS: Record<string, string> = {
     }
   });
 
-  // --- Connect ---
+  // --- Reconnect ---
 
-  connectBtn.addEventListener("click", async () => {
-    connectBtn.textContent = "Connecting...";
-    connectBtn.disabled = true;
+  reconnectBtn.addEventListener("click", async () => {
+    reconnectBtn.textContent = "Connecting...";
+    reconnectBtn.disabled = true;
 
     const hasPerms = await chrome.permissions.contains({
       permissions: ["tabs"],
@@ -143,8 +145,8 @@ const PERM_LABELS: Record<string, string> = {
         origins: ["http://127.0.0.1/*"],
       });
       if (!granted) {
-        connectBtn.textContent = "Connect";
-        connectBtn.disabled = false;
+        reconnectBtn.textContent = "Reconnect";
+        reconnectBtn.disabled = false;
         return;
       }
     }
@@ -172,8 +174,8 @@ const PERM_LABELS: Record<string, string> = {
     });
 
     updateUI(connected);
-    connectBtn.textContent = "Connect";
-    connectBtn.disabled = false;
+    reconnectBtn.textContent = "Reconnect";
+    reconnectBtn.disabled = false;
   });
 
   // --- Disconnect ---
@@ -188,7 +190,7 @@ const PERM_LABELS: Record<string, string> = {
   let updateTimer: ReturnType<typeof setTimeout> | null = null;
   chrome.storage.session.onChanged.addListener((changes) => {
     if (changes["crawlio:bridgeConnected"]) {
-      if (connectBtn.disabled) return;
+      if (reconnectBtn.disabled) return;
       chrome.storage.session.get("crawlio:bridgeConnected").then((data) => {
         const connected = data["crawlio:bridgeConnected"] === true;
         if (updateTimer) clearTimeout(updateTimer);

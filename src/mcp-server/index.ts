@@ -12,6 +12,9 @@ import { PKG_VERSION } from "../shared/constants.js";
 import { WebSocketBridge } from "./websocket-bridge.js";
 import { CrawlioClient } from "./crawlio-client.js";
 import { createTools, createCodeModeTools, TOOL_TIMEOUTS, toolError, ensurePermission, PERMISSION_EXEMPT_TOOLS } from "./tools.js";
+import { isContentBoundariesEnabled, wrapPageContent, PAGE_SOURCED_TOOLS } from "./content-boundary.js";
+import { loadActionPolicy, checkActionPolicy, initPolicyReloader, reloadPolicyIfChanged, type ActionPolicy } from "./action-policy.js";
+import { getMaxOutput, truncateOutput } from "./output-limits.js";
 
 process.title = "Crawlio Agent";
 
@@ -37,9 +40,23 @@ const crawlio = new CrawlioClient();
 const tools = codeMode ? createCodeModeTools(bridge, crawlio) : createTools(bridge, crawlio);
 
 if (!codeMode) {
-  console.error("[MCP] Full mode — exposing all 100 tools");
+  console.error("[MCP] Full mode — exposing all 114 tools");
 } else {
   console.error("[MCP] Code mode (default) — 3 tools (search, execute, connect_tab)");
+}
+
+// --- Action policy ---
+let actionPolicy: ActionPolicy | null = null;
+const policyPath = process.env.CRAWLIO_ACTION_POLICY;
+if (policyPath) {
+  try {
+    actionPolicy = loadActionPolicy(policyPath);
+    initPolicyReloader(policyPath, actionPolicy);
+    console.error(`[MCP] Action policy loaded from ${policyPath} (default: ${actionPolicy.default})`);
+  } catch (err) {
+    console.error(`[MCP] Failed to load action policy from ${policyPath}: ${err instanceof Error ? err.message : err}`);
+    process.exit(1);
+  }
 }
 
 function createMcpServer(): Server {
@@ -71,6 +88,15 @@ function createMcpServer(): Server {
       }
     }
 
+    // Action policy enforcement — hot-reload on each call
+    const currentPolicy = reloadPolicyIfChanged() ?? actionPolicy;
+    if (currentPolicy) {
+      const decision = checkActionPolicy(toolName, currentPolicy);
+      if (decision === "deny") {
+        return toolError(`Action '${toolName}' denied by action policy`);
+      }
+    }
+
     const timeout = TOOL_TIMEOUTS[toolName] ?? 30000;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
@@ -84,9 +110,37 @@ function createMcpServer(): Server {
           );
         }),
       ]);
-      return result as {
+      const typed = result as {
         content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+        isError?: boolean;
       };
+
+      // Apply output limits to page-sourced tool output (opt-in via CRAWLIO_MAX_OUTPUT env var)
+      const maxOutput = getMaxOutput();
+      if (!typed.isError && maxOutput !== null && PAGE_SOURCED_TOOLS.has(toolName)) {
+        for (const item of typed.content) {
+          if (item.type === "text" && item.text) {
+            const result = truncateOutput(item.text, maxOutput);
+            item.text = result.content;
+          }
+        }
+      }
+
+      // Apply content boundaries to page-sourced tool output (opt-in via CRAWLIO_CONTENT_BOUNDARIES=1)
+      if (!typed.isError && isContentBoundariesEnabled() && PAGE_SOURCED_TOOLS.has(toolName)) {
+        let origin = "unknown";
+        try {
+          const status = await bridge.send({ type: "get_connection_status" }, 3000) as { connectedTab?: { url?: string } };
+          origin = status?.connectedTab?.url || "unknown";
+        } catch { /* fall back to "unknown" origin */ }
+        for (const item of typed.content) {
+          if (item.type === "text" && item.text) {
+            item.text = wrapPageContent(item.text, origin);
+          }
+        }
+      }
+
+      return typed;
     } catch (error) {
       if (error instanceof ZodError) {
         const issues = error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ");
@@ -141,9 +195,12 @@ async function main() {
   }
 }
 
+const PORTAL_CORS_ENV = process.env.PORTAL_CORS_ORIGINS;
 const ALLOWED_ORIGINS: RegExp[] = [
-  /^https:\/\/.*\.cloudflare\.com$/,
-  /^https:\/\/.*\.workers\.dev$/,
+  ...(PORTAL_CORS_ENV
+    ? PORTAL_CORS_ENV.split(",").map(o => new RegExp(`^${o.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`))
+    : []),
+  /^https:\/\/dash\.cloudflare\.com$/,
   /^https:\/\/.*\.crawlio\.app$/,
   /^https:\/\/crawlio\.app$/,
   /^chrome-extension:\/\//,

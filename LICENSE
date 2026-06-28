@@ -1,0 +1,50 @@
+Crawlio Proprietary License
+Copyright (c) 2026 Crawlio. All rights reserved.
+
+This software, including any builds, binaries, models, datasets, and
+accompanying materials (the "Software"), is proprietary and confidential.
+The source code of the Software is NOT provided and is not open source.
+
+1. License grant.
+   Subject to a valid Crawlio license (Free, Core, or Pro tier) and your
+   compliance with these terms, Crawlio grants you a personal, non-exclusive,
+   non-transferable, revocable license to download, install, and run the
+   officially distributed, signed binary builds of the Software for their
+   intended purpose.
+
+2. Restrictions.
+   You may NOT, in whole or in part: (a) copy, modify, adapt, translate, or
+   create derivative works of the Software; (b) reverse engineer, decompile,
+   disassemble, deobfuscate, or otherwise attempt to derive source code,
+   algorithms, models, or data from the Software, except to the limited extent
+   such restriction is prohibited by applicable law; (c) redistribute,
+   sublicense, sell, rent, lease, lend, host, or otherwise transfer or make the
+   Software available to any third party; (d) remove, alter, or obscure any
+   proprietary notices; or (e) use the Software to develop or assist a competing
+   product or service.
+
+3. Ownership.
+   The Software is licensed, not sold. Crawlio retains all right, title, and
+   interest in and to the Software, including all intellectual property rights.
+   No rights are granted except as expressly set out here.
+
+4. No source distribution.
+   Source code is not made available under this license. Distribution is limited
+   to signed, compiled binary artifacts published through official channels.
+
+5. Termination.
+   This license terminates automatically and immediately upon any breach. On
+   termination you must cease all use and destroy all copies of the Software.
+
+6. Disclaimer of warranty.
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+7. Limitation of liability.
+   IN NO EVENT SHALL CRAWLIO BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+   OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+For licensing and pricing: https://crawlio.app/pricing
